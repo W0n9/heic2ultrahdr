@@ -55,7 +55,12 @@ jobs:
         # clang 钉 18：默认 clang 在 26.04 是 21，bindgen 0.69/0.71 不支持，
         # 解析 ffmpeg 头会生成残缺 struct 导致 rsmpeg 编译失败；24.04 默认是
         # 18（已知良好）。LIBCLANG_PATH 在 Compile Rust 步骤设置。
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake nasm clang-18
+        # exiftool 供 Test 步骤使用：转换流程依赖它写入输出元数据。
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake nasm clang-18 libimage-exiftool-perl
+
+      - name: Install exiftool (macOS)
+        if: runner.os == 'macOS'
+        run: brew install exiftool
 
       - name: Build C dependencies (Linux/macOS)
         if: runner.os != 'Windows'
@@ -140,6 +145,19 @@ jobs:
           source scripts/ci-env.sh
           cargo build --bin heic2ultrahdr --release
           cp target/release/heic2ultrahdr heic2ultrahdr
+
+      # 测试跑真实转换（tests/IMG_3853.HEIC + .MOV），断言直接读产物字节，
+      # 不依赖 exiftool 的解读。Windows 不跑：它走 vcpkg/pwsh 独立分支，
+      # 在那里装 exiftool 的成本与收益不成比例。
+      - name: Test (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            export LIBCLANG_PATH=/usr/lib/llvm-18/lib
+          fi
+          source scripts/ci-env.sh
+          cargo test --release
 
       - name: Compile Rust (Windows)
         if: runner.os == 'Windows'
