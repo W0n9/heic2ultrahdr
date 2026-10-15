@@ -14,7 +14,10 @@ if [ ! -d "$build" ]; then
     mkdir $build
 fi
 cd $build
-cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+# CMake 4 移除了对 <3.5 的兼容，libde265 v1.0.15 还声明着 3.3.2；
+# 这个变量是 CMake 官方的最低版本逃生口，旧 CMake 上无害。
+cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
     -DCMAKE_INSTALL_PREFIX=$install \
     $path
 cmake --build $build --parallel "$JOBS"

@@ -14,275 +14,182 @@ on:
         required: false
         default: nightly
 
+permissions:
+  contents: read
+
 jobs:
-  Linux:
-    name: "Build Linux Release"
+  build:
+    name: "Build Release (${{ matrix.runner.os }}, ${{ matrix.runner.arch }})"
     runs-on: ${{ matrix.runner.os }}
     strategy:
+      fail-fast: false
       matrix:
         runner:
-          # https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners#standard-github-hosted-runners-for-public-repositories
-          - { os: ubuntu-24.04, arch: x64 }
+          - { os: ubuntu-26.04, arch: x64 }
+          - { os: macos-26, arch: arm64 }
+          - { os: windows-2025, arch: x64 }
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          sudo apt install -y build-essential apt-utils cmake clang nasm
+      - uses: actions/checkout@v7
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Setup directories
-        run: |
-          mkdir -p deps
-          mkdir -p pkg-config
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2.9.2
 
-      - name: Cache deps
-        uses: actions/cache@v4.2.0
+      - name: Cache C dependencies
+        uses: actions/cache@v6.1.0
         with:
           path: |
             deps
             pkg-config
-          key: ${{ runner.os }}-${{ runner.arch }}-deps
+          # key 只含真正决定产物内容的三个构建脚本：版本号/编译参数变了才失效。
+          # 编排脚本（linux-build-all.sh）、env 脚本等改动不应让 ffmpeg 这种大件
+          # 冷重建；restore-keys 前缀回退保证 key 变化时仍能接上旧缓存增量重建。
+          key: ${{ runner.os }}-${{ runner.arch }}-deps-${{ hashFiles('scripts/linux-build-libjpeg.sh', 'scripts/linux-build-libffmpeg.sh', 'scripts/linux-build-libuhdr.sh') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-deps-
 
-      - name: Build and Install libjpeg
+      # ---- Linux / macOS 共用的 C 依赖构建（windows 走独立分支） ----
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        # clang 钉 18：默认 clang 在 26.04 是 21，bindgen 0.69/0.71 不支持，
+        # 解析 ffmpeg 头会生成残缺 struct 导致 rsmpeg 编译失败；24.04 默认是
+        # 18（已知良好）。LIBCLANG_PATH 在 Compile Rust 步骤设置。
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake nasm clang-18
+
+      - name: Build C dependencies (Linux/macOS)
+        if: runner.os != 'Windows'
         run: |
-          ./scripts/linux-build-libjpeg.sh deps pkg-config
-          cmake --install deps/libjpeg/build
+          ./scripts/linux-build-all.sh "$GITHUB_WORKSPACE/deps" "$GITHUB_WORKSPACE/pkg-config"
 
-      - name: Build and install libde265
-        run: |
-          ./scripts/linux-build-libde265.sh deps pkg-config
-          cmake --install deps/libde265/build
-
-      - name: Build and install libheif
-        run: |
-          ./scripts/linux-build-libheif.sh deps pkg-config
-          cmake --install deps/libheif/build
-
-      - name: Build and install libuhdr
-        run: |
-          ./scripts/linux-build-libuhdr.sh deps pkg-config
-          cmake --install deps/libuhdr/build
-
-      - name: Build and install libffmpeg
-        run: |
-          ./scripts/linux-build-libffmpeg.sh deps pkg-config
-          cd deps/libffmpeg && make install
-
-      - name: Compile Rust
-        run: |
-          export PKG_CONFIG_PATH=$(realpath pkg-config/lib/pkgconfig)
-          export PKG_CONFIG_LIBDIR=$(realpath pkg-config/lib)
-          export PKG_CONFIG_ALL_STATIC=true
-          export TURBOJPEG_STATIC=1
-          export TURBOJPEG_LIB_DIR=$(realpath pkg-config/lib)
-          export TURBOJPEG_INCLUDE_PATH=$(realpath pkg-config/include)
-          export FFMPEG_PKG_CONFIG_PATH=$(realpath pkg-config/lib/pkgconfig)
-          cargo build --bin heic2ultrahdr --release
-          cp target/release/heic2ultrahdr heic2ultrahdr
-
-      - uses: actions/upload-artifact@v4
+      # ---- Windows：vcpkg + 自带脚本 ----
+      # ilammy/msvc-dev-cmd 上游 2024-03 停更、卡在 node20（runner 已强制
+      # node24 并告警）；此 repo 是其等价 fork，v4 起跑 node24。SDL 的 CI
+      # 也做了同样迁移。默认 arch=amd64 与 ilammy 无参调用等价。
+      - name: Set up Visual Studio shell (Windows)
+        if: runner.os == 'Windows'
+        uses: TheMrMilchmann/setup-msvc-dev@v4
         with:
-          name: ${{ matrix.runner.os }}-${{ matrix.runner.arch }}
-          path: |
-            heic2ultrahdr
-            README-prebuilt.md
-          if-no-files-found: error
-          retention-days: 1
+          arch: x64
 
-  macOS:
-    name: "Build macOS Release"
-    runs-on: ${{ matrix.runner.os }}
-    strategy:
-      matrix:
-        runner:
-          # https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners#standard-github-hosted-runners-for-public-repositories
-          - { os: macos-13, arch: intel }
-          - { os: macos-14, arch: arm64 }
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-
-      - name: Setup directories
+      - name: Set up vcpkg (Windows)
+        if: runner.os == 'Windows'
         run: |
-          mkdir -p deps
-          mkdir -p pkg-config
-
-      - name: Cache deps
-        uses: actions/cache@v4.2.0
-        with:
-          path: |
-            deps
-            pkg-config
-          key: ${{ runner.os }}-${{ runner.arch }}-deps
-
-      - name: Build and Install libjpeg
-        run: |
-          ./scripts/linux-build-libjpeg.sh deps pkg-config
-          cmake --install deps/libjpeg/build
-
-      - name: Build and install libde265
-        run: |
-          ./scripts/linux-build-libde265.sh deps pkg-config
-          cmake --install deps/libde265/build
-
-      - name: Build and install libheif
-        run: |
-          ./scripts/linux-build-libheif.sh deps pkg-config
-          cmake --install deps/libheif/build
-
-      - name: Build and install libuhdr
-        run: |
-          ./scripts/linux-build-libuhdr.sh deps pkg-config
-          cmake --install deps/libuhdr/build
-
-      - name: Build and install libffmpeg
-        run: |
-          ./scripts/mac-install-nasm.sh
-          ./scripts/linux-build-libffmpeg.sh deps pkg-config
-          cd deps/libffmpeg && make install
-
-      - name: Compile Rust
-        run: |
-          export PKG_CONFIG_PATH=$(realpath pkg-config/lib/pkgconfig):$(realpath pkg-config/lib)
-          export PKG_CONFIG_LIBDIR=$(realpath pkg-config/lib)
-          export PKG_CONFIG_ALL_STATIC=true
-          export TURBOJPEG_STATIC=1
-          export TURBOJPEG_LIB_DIR=$(realpath pkg-config/lib)
-          export TURBOJPEG_INCLUDE_PATH=$(realpath pkg-config/include)
-          export FFMPEG_PKG_CONFIG_PATH=$(realpath pkg-config/lib/pkgconfig)
-          cargo build --bin heic2ultrahdr --release
-          cp target/release/heic2ultrahdr heic2ultrahdr
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.runner.os }}-${{ matrix.runner.arch }}
-          path: |
-            heic2ultrahdr
-            README-prebuilt.md
-          if-no-files-found: error
-          retention-days: 1
-
-  Windows:
-    name: "Build Windows Release"
-    runs-on: ${{ matrix.runner.os }}
-    strategy:
-      matrix:
-        runner:
-          - { os: windows-2022, arch: x64 }
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Visual Studio shell
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - uses: lukka/get-cmake@latest
-        with:
-          cmakeVersion: "~3.31.0"
-
-      - name: Set up vcpkg
-        run: |
+          # 钉在 commit cf1f98216d（2026-06-18，ffmpeg port 还是 8.1.2 的最后一个
+          # 提交）：rsmpeg 0.15 只兼容 ffmpeg 6/7 的 API，master 已升到 9。
+          # 不用更老的 release tag（2025.03.19）：它的 msys2 固定快照（file 5.45-3
+          # 等）已从所有镜像滚动删除，404。新脚本 + manifest 锁版本的组合不成立
+          # （老 tag 同样没有好快照），所以选「新脚本 + ffmpeg<9 的最后一个提交」。
+          # 注意：pwsh 没有 rm -rf（-rf 不是参数）。
+          # pwsh7 直接调 2025.03.19 的 bootstrap.bat 会因位置参数报
+          # "Only named parameters are allowed"，走 cmd /c 调用。
+          Remove-Item -Force -Recurse C:/vcpkg
           git clone https://github.com/microsoft/vcpkg.git C:/vcpkg
-          C:/vcpkg/bootstrap-vcpkg.bat
+          git -C C:/vcpkg checkout --detach cf1f98216ddd83d3dc838e96ba1143801992f71e
+          cmd /c "C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics"
 
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
+      - name: Cache vcpkg (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v6.1.0
         with:
-          toolchain: stable
-          override: true
+          path: c:/vcpkg
+          key: ${{ runner.os }}-${{ runner.arch }}-vcpkg-ff8-${{ hashFiles('scripts/windows-build.ps1') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-vcpkg-ff8-
 
-      - name: Cache
-        uses: actions/cache@v4.2.0
+      # vcpkg per-port 二进制缓存（files backend）：目录缓存（整棵 C:/vcpkg）
+      # 失效时，vcpkg 从这里按 ABI hash 恢复 libheif/ffmpeg 的预编译包，
+      # 而不是冷编 ffmpeg 依赖树（MSVC 下约 2 小时）。key 固定——失效语义
+      # 由 vcpkg 的 ABI hash 自己管（ports 被钉死所以 ABI 稳定）；若某天
+      # 升级 vcpkg 导致目录膨胀，把 v1 bump 成 v2 即可整体清理。
+      - name: Cache vcpkg binary packages (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v6.1.0
         with:
-          path: |
-            c:/vcpkg
-            deps
-            pkg-config
-          key: ${{ runner.os }}-${{ runner.arch }}-deps
+          path: C:/vcpkg-binary
+          key: ${{ runner.os }}-${{ runner.arch }}-vcpkgbin-v1
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-vcpkgbin-
 
-      - name: Install libheif
+      - name: Build C dependencies (Windows)
+        if: runner.os == 'Windows'
+        env:
+          VCPKG_ROOT: C:\vcpkg
+          # files backend 存本地目录、由上面的 cache step 持久化。
+          # 不用 x-gha：vcpkg 已移除该 backend（会打 warning 且不生效）。
+          VCPKG_BINARY_SOURCES: "clear;files,C:/vcpkg-binary,readwrite"
+        shell: pwsh
         run: |
           . ./scripts/windows-build.ps1
           vcpkg install libheif --triplet x64-windows-static-md
-
-      - name: Build libjpeg
-        run: |
-          . ./scripts/windows-build.ps1
           Build-Jpeg
-
-      - name: Build libultrahdr
-        run: |
-          . ./scripts/windows-build.ps1
           Build-Uhdr
-
-      - name: Build and install libffmpeg
-        run: |
-          . ./scripts/windows-build.ps1
           Build-FFmpeg
 
-      - name: Compile Rust
+      # ---- Rust 编译 ----
+      # Windows 的链接器选择对 PATH 敏感：bash 环境里 Git 的 /usr/bin/link.exe
+      # 会抢先于 MSVC link.exe（错误表现为 link: extra operand），所以 Windows
+      # 走 pwsh + windows-build.ps1 的 Compile-Rust（其中还会设置 UHDR/TURBOJPEG 变量）。
+      - name: Compile Rust (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
-          $env:VCPKG_ROOT="C:\vcpkg"
+          # Linux 上 bindgen 用钉住的 clang-18 的 libclang（见安装步骤注释）；
+          # macOS 用 Xcode 的，不动。
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            export LIBCLANG_PATH=/usr/lib/llvm-18/lib
+          fi
+          source scripts/ci-env.sh
+          cargo build --bin heic2ultrahdr --release
+          cp target/release/heic2ultrahdr heic2ultrahdr
+
+      - name: Compile Rust (Windows)
+        if: runner.os == 'Windows'
+        env:
+          VCPKG_ROOT: C:\vcpkg
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\vcpkg\installed\x64-windows-static-md\bin;$env:PATH"
           . ./scripts/windows-build.ps1
           Compile-Rust
           cp target/release/heic2ultrahdr.exe heic2ultrahdr.exe
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.runner.os }}-${{ matrix.runner.arch }}
           path: |
-            heic2ultrahdr.exe
+            heic2ultrahdr*
             README-prebuilt.md
-
           if-no-files-found: error
           retention-days: 1
 
   publish:
-    needs: [Linux, macOS, Windows]
-    runs-on: ubuntu-22.04
+    needs: [build]
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
       - if: github.event_name == 'workflow_dispatch'
         run: echo "TAG_NAME=${{ github.event.inputs.tag_name }}" >> $GITHUB_ENV
 
-      - if: github.event_name == 'schedule'
-        run: echo 'TAG_NAME=nightly' >> $GITHUB_ENV
-
       - if: github.event_name == 'push'
         run: |
           TAG_NAME=${{ github.ref }}
           echo "TAG_NAME=${TAG_NAME#refs/tags/}" >> $GITHUB_ENV
 
-      - uses: actions/download-artifact@v4
-        with:
-          merge-multiple: false
+      - uses: actions/download-artifact@v8
 
       - name: List downloaded files
         run: |
           tree -L 3
-          zip macos-intel.zip mac*-intel/*
-          zip macos-arm64.zip mac*-arm64/*
-          zip linux-x64.zip   ubuntu*/*
-          zip windows-x64.zip windows-*-x64/*
+          # artifact 名 = matrix 的 `${{ runner.os }}-${{ runner.arch }}`，
+          # 新 runner 组合是 macos-26-arm64 / ubuntu-26.04-x64 / windows-2025-x64。
+          zip macos.zip   macos-26-arm64/*
+          zip linux.zip   ubuntu-26.04-x64/*
+          zip windows.zip windows-2025-x64/*
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         if: github.event_name != 'pull_request'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          body: ${{ env.BODY }}
-          prerelease: ${{ env.TAG_NAME == 'nightly' }}
           tag_name: ${{ env.TAG_NAME }}
+          prerelease: ${{ env.TAG_NAME == 'nightly' }}
           files: |
             ./*.zip
