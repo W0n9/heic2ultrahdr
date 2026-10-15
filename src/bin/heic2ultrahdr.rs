@@ -12,6 +12,7 @@ use tracing_subscriber::prelude::*;
 use heic2ultrahdr::discover::{self, DiscoverOptions};
 
 #[derive(Parser)]
+#[command(version, about = "Convert Apple HEIC photos into UltraHDR JPEG motion photos")]
 pub struct Args {
     /// Path to the directory containing images and videos to convert
     pub path: PathBuf,
