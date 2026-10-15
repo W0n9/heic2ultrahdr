@@ -61,8 +61,8 @@ Function Compile-Rust {
 
     $env:PATH = "$env:PATH;$env:UHDR_LIB_PATH;$root/deps/install/bin"
 
-    cargo build --example heic2ultrahdr --release
-    # cargo run --example heic2ultrahdr --release
+    cargo build --bin heic2ultrahdr --release
+    # cargo run --bin heic2ultrahdr --release
 }
 
 #Build-Heif

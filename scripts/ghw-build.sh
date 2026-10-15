@@ -23,5 +23,5 @@ env PKG_CONFIG_PATH=$install/lib/pkgconfig PKG_CONFIG_LIBDIR=$install/lib \
     PKG_CONFIG_ALL_STATIC=true \
     TURBOJPEG_STATIC=1 TURBOJPEG_LIB_DIR=$install/lib TURBOJPEG_INCLUDE_PATH=$install/include \
     FFMPEG_PKG_CONFIG_PATH=$install/lib/pkgconfig \
-    cargo build --example heic2ultrahdr --release
-ldd target/release/examples/heic2ultrahdr
+    cargo build --bin heic2ultrahdr --release
+ldd target/release/heic2ultrahdr

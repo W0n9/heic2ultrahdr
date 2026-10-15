@@ -20,12 +20,12 @@ RUN ./scripts/linux-build-libffmpeg.sh deps pkg-config && \
 RUN env PKG_CONFIG_PATH=$(realpath pkg-config/lib/pkgconfig) PKG_CONFIG_LIBDIR=$(realpath pkg-config/lib) \
         PKG_CONFIG_ALL_STATIC=true \
         TURBOJPEG_STATIC=1 TURBOJPEG_LIB_DIR=$(realpath pkg-config/lib) TURBOJPEG_INCLUDE_PATH=$(realpath pkg-config/include) \
-    cargo build --example heic2ultrahdr --release
+    cargo build --bin heic2ultrahdr --release
 
 # runtime
 FROM debian:bookworm
 WORKDIR /code
 
 RUN apt-get update && apt-get install exiftool -y
-COPY --from=builder /code/target/release/examples/heic2ultrahdr ./heic2ultrahdr
+COPY --from=builder /code/target/release/heic2ultrahdr ./heic2ultrahdr
 ENTRYPOINT ["/code/heic2ultrahdr"]
