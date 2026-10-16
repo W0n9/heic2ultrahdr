@@ -2,7 +2,11 @@
 //! 全部走公共 seam：`discover(root, &DiscoverOptions)`。
 
 use heic2ultrahdr::discover::{discover, DiscoverOptions, DiscoveryIssueKind};
-use std::{collections::HashSet, fs, path::PathBuf};
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 /// 每个测试一个临时目录 fixture。
 struct Fixture(tempfile::TempDir);
@@ -26,6 +30,20 @@ fn opts() -> DiscoverOptions {
     DiscoverOptions::default()
 }
 
+/// 两个路径是否指向同一个文件。
+///
+/// macOS 的默认文件系统大小写不敏感：创建 `IMG_0005.HEIC` 之后，`read_dir`
+/// 返回的文件名大小写可能与创建时不同。因此凡是断言「discover 返回的路径就是
+/// 我刚创建的那个文件」的地方，都忽略大小写比较 —— 要验证的是配对逻辑，不是
+/// 文件系统如何保存文件名。
+fn same_file(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
+fn assert_same_file(actual: &Path, expected: &Path) {
+    assert!(same_file(actual, expected), "expected {actual:?} to be the same file as {expected:?}");
+}
+
 #[test]
 fn heic_with_paired_mov_discovers_one_task() {
     let f = Fixture::new();
@@ -37,7 +55,7 @@ fn heic_with_paired_mov_discovers_one_task() {
     assert!(d.issues.is_empty(), "unexpected issues: {:?}", d.issues);
     assert_eq!(d.photos.len(), 1);
     let p = &d.photos[0];
-    assert_eq!(p.image, heic);
+    assert_same_file(&p.image, &heic);
     assert_eq!(p.video.as_deref(), Some(mov.as_path()));
     assert_eq!(p.output, f.root().join("IMG_0001.jpg"));
 }
@@ -51,11 +69,11 @@ fn heic_wins_over_jpg_with_same_stem() {
     let d = discover(&f.root(), &opts()).unwrap();
 
     assert_eq!(d.photos.len(), 1);
-    assert_eq!(d.photos[0].image, heic);
+    assert_same_file(&d.photos[0].image, &heic);
     // jpg 被忽略要记 issue
     assert_eq!(d.issues.len(), 1);
     assert_eq!(d.issues[0].kind, DiscoveryIssueKind::DuplicateImage);
-    assert_eq!(d.issues[0].path, jpg);
+    assert_same_file(&d.issues[0].path, &jpg);
 }
 
 #[test]
@@ -67,7 +85,7 @@ fn static_heic_without_video_discovers_one_task() {
 
     assert!(d.issues.is_empty(), "unexpected issues: {:?}", d.issues);
     assert_eq!(d.photos.len(), 1);
-    assert_eq!(d.photos[0].image, heic);
+    assert_same_file(&d.photos[0].image, &heic);
     assert_eq!(d.photos[0].video, None);
     assert_eq!(d.photos[0].output, f.root().join("IMG_0003.jpg"));
 }
@@ -82,7 +100,7 @@ fn jpg_only_stem_is_skipped_as_not_heic() {
     assert!(d.photos.is_empty());
     assert_eq!(d.issues.len(), 1);
     assert_eq!(d.issues[0].kind, DiscoveryIssueKind::NotHeic);
-    assert_eq!(d.issues[0].path, jpg);
+    assert_same_file(&d.issues[0].path, &jpg);
 }
 
 #[test]
@@ -95,8 +113,8 @@ fn paired_stem_builds_exactly_one_task_whichever_file_is_visited() {
 
     // 有视频时由「迭代到视频」触发；图片入口不该再建一次任务。
     assert_eq!(d.photos.len(), 1, "photos: {:?}", d.photos);
-    assert_eq!(d.photos[0].image, heic);
-    assert_eq!(d.photos[0].video.as_deref(), Some(mov.as_path()));
+    assert_same_file(&d.photos[0].image, &heic);
+    assert_same_file(d.photos[0].video.as_deref().expect("video should be paired"), &mov);
 }
 
 #[test]
@@ -113,7 +131,7 @@ fn heic_and_mov_in_subdirectory_are_discovered() {
 
     assert!(d.issues.is_empty(), "unexpected issues: {:?}", d.issues);
     assert_eq!(d.photos.len(), 1);
-    assert_eq!(d.photos[0].image, heic);
+    assert_same_file(&d.photos[0].image, &heic);
     assert_eq!(d.photos[0].output, sub.join("IMG_0006.jpg"));
 }
 
@@ -127,7 +145,7 @@ fn unknown_extension_file_is_ignored_silently() {
 
     // 扩展名不认识的普通文件是目录里的常态（.txt、.DS_Store…），直接忽略。
     assert_eq!(d.photos.len(), 1);
-    assert_eq!(d.photos[0].image, heic);
+    assert_same_file(&d.photos[0].image, &heic);
     assert!(d.issues.is_empty(), "unexpected issues: {:?}", d.issues);
 }
 
@@ -142,7 +160,7 @@ fn symlink_is_skipped_and_recorded() {
     let d = discover(&f.root(), &opts()).unwrap();
 
     assert_eq!(d.photos.len(), 2, "symlink 的目标文件仍应作为普通文件处理: {:?}", d.photos);
-    assert!(d.photos.iter().any(|p| p.image == heic));
+    assert!(d.photos.iter().any(|p| same_file(&p.image, &heic)), "photos: {:?}", d.photos);
     assert!(d.issues.iter().any(|i| i.kind == DiscoveryIssueKind::SymlinkSkipped));
 }
 
@@ -227,8 +245,8 @@ fn duplicate_outputs_are_deduped() {
     let outputs: Vec<_> = d.photos.iter().map(|p| &p.output).collect();
     assert_eq!(d.photos.len(), 1, "photos: {:?}", d.photos);
     assert_eq!(outputs.len(), outputs.iter().collect::<HashSet<_>>().len());
-    assert_eq!(d.photos[0].image, heic);
-    assert_eq!(d.photos[0].video.as_deref(), Some(mov.as_path()));
+    assert_same_file(&d.photos[0].image, &heic);
+    assert_same_file(d.photos[0].video.as_deref().expect("video should be paired"), &mov);
 }
 
 #[test]
@@ -245,7 +263,7 @@ fn symlinked_pair_is_not_selected_by_find_ext() {
 
     // 视频 entry 被 walk 跳过 + find_ext 不跟随链接 → 退化为静态照片任务，而不是消失。
     assert_eq!(d.photos.len(), 1, "photos: {:?}", d.photos);
-    assert_eq!(d.photos[0].image, heic);
+    assert_same_file(&d.photos[0].image, &heic);
     assert_eq!(d.photos[0].video, None);
     assert!(d.issues.iter().any(|i| i.kind == DiscoveryIssueKind::SymlinkSkipped));
 }
