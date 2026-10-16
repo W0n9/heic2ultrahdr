@@ -104,8 +104,8 @@ impl ConvertRequest {
             for j in 0..width {
                 let index = i * hdr_gainmap.stride + j;
                 let u = hdr_gainmap.data[index] as f32 / 255.0;
-                // transform encoded hdr gainmap to linear value by applying reverse sRGB transform
-                let apple_gainmap_linear = Self::reverse_srgb_transform(u); // [0, 1]
+                // transform encoded hdr gainmap to linear value by applying reverse Rec.709 transform
+                let apple_gainmap_linear = Self::reverse_rec709_transform(u); // [0, 1]
 
                 // As per <https://developer.android.com/media/platform/hdr-image-format#encode>
                 // and <https://developer.apple.com/documentation/appkit/applying-apple-hdr-effect-to-your-photos>
@@ -142,12 +142,21 @@ impl ConvertRequest {
         Ok(jpg)
     }
 
+    /// 逆 Rec.709 OETF：把 gain map 的编码值还原成线性增益。
+    ///
+    /// Apple 文档规定 gain map 以 Rec.709 传输函数编码，见
+    /// `notes/hdr-formats-research.md` A.2 的引文。分段点 0.081、斜率 1/4.5、
+    /// 指数 1/0.45 ≈ 2.222。
+    ///
+    /// 这**不是**逆 sRGB EOTF：两者分段点（0.081 对 0.04045）与指数（≈2.222 对 2.4）
+    /// 都不同，线性化结果在 u = 0.5 处相差 21%，越低差得越多。用错会让 HDR 重建
+    /// 系统性偏暗 0.08–0.16 stop（实测见 `notes/hdr-formats-research.md` A.8.1）。
     #[inline]
-    fn reverse_srgb_transform(u: f32) -> f32 {
-        if u <= 0.04045 {
-            u / 12.92
+    fn reverse_rec709_transform(u: f32) -> f32 {
+        if u < 0.081 {
+            u / 4.5
         } else {
-            ((u + 0.055) / 1.055).powf(2.4)
+            ((u + 0.099) / 1.099).powf(1.0 / 0.45)
         }
     }
 
@@ -288,5 +297,51 @@ impl ConvertRequest {
         std::fs::write(output, output_img.as_bytes())?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConvertRequest;
+
+    /// 钉住 gain map 线性化的期望值。
+    ///
+    /// Apple 文档规定 gain map 用 Rec.709 传输函数编码（引文见 `notes/hdr-formats-research.md`
+    /// A.2），这里钉住其反函数在若干代表点上的取值，防止它被无声改动。
+    /// 期望值是独立算出的，不是从本实现反推的。
+    #[test]
+    fn rec709_inverse_is_pinned_at_representative_points() {
+        let cases: &[(f32, f32)] = &[
+            (0.0, 0.0),
+            (0.04, 0.008_888_889),  // 分段点以下：线性段，斜率 1/4.5
+            (0.081, 0.017_945_023), // 分段点本身，走上分支
+            (0.25, 0.078_153_88),
+            (0.5, 0.259_589_4),
+            (1.0, 1.0),
+        ];
+        for (u, expected) in cases {
+            let got = ConvertRequest::reverse_rec709_transform(*u);
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "reverse_rec709_transform({u}) = {got}，期望 {expected}"
+            );
+        }
+    }
+
+    /// 分段点以下必须是斜率为 1/4.5 的直线——这是 Rec.709 与 sRGB 最容易被混淆的地方。
+    /// 端点 0.0 与 1.0 的取值由上一个测试钉住，这里只管斜率。
+    #[test]
+    fn rec709_inverse_is_linear_below_the_breakpoint() {
+        assert_eq!(ConvertRequest::reverse_rec709_transform(0.0405), 0.0405 / 4.5);
+        assert_eq!(ConvertRequest::reverse_rec709_transform(0.080), 0.080 / 4.5);
+    }
+
+    /// 这两个函数不可互换：分段点 0.081 vs 0.04045，指数 1/0.45 vs 2.4，中段差约 21%。
+    /// 记录这个事实，免得日后有人「顺手」换回 sRGB。
+    #[test]
+    fn rec709_inverse_is_not_the_srgb_one() {
+        const SRGB_AT_HALF: f32 = 0.214_041_14; // 逆 sRGB EOTF 在 u = 0.5 处的值
+        let ratio = ConvertRequest::reverse_rec709_transform(0.5) / SRGB_AT_HALF;
+        assert!((ratio - 1.2128).abs() < 1e-3, "比值 {ratio}");
     }
 }

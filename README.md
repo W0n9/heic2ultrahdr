@@ -223,7 +223,7 @@ This is the core of the work. Let `hr` be the Apple headroom and `u ∈ [0, 255]
 ```mermaid
 flowchart LR
     U["Apple gain map<br/>8-bit value u"] --> N["normalise<br/>u / 255"]
-    N --> L["inverse sRGB<br/>to linear in 0..1"]
+    N --> L["inverse Rec.709<br/>to linear in 0..1"]
     HR["Apple headroom hr<br/>XMP or MakerNotes"] --> R
     L --> R["log_recovery =<br/>ln(1 + (hr-1)*linear) / ln(hr)"]
     R --> Q["clamp to 0..1<br/>quantise to 8 bit"]
@@ -233,13 +233,17 @@ flowchart LR
 Step by step:
 
 1. **Normalise and linearise.** The stored gain map value must be linearised before use.
-   This implementation applies the inverse sRGB EOTF; see §6 for how that choice relates
-   to Apple's documentation, which specifies the Rec.709 transfer function.
+   Apple's documentation specifies the Rec.709 transfer function for this, and this
+   implementation applies its inverse:
 
    ```
-   linear = u / 12.92                     if u <= 0.04045
-   linear = ((u + 0.055) / 1.055) ^ 2.4   otherwise
+   linear = u / 4.5                            if u < 0.081
+   linear = ((u + 0.099) / 1.099) ^ (1 / 0.45) otherwise
    ```
+
+   The inverse sRGB EOTF is a plausible alternative and has been used here in the past.
+   It is not the same function — breakpoint 0.081 against 0.04045, exponent approximately
+   2.222 against 2.4 — and §6 records how far apart the two actually land.
 
 2. **Choose the UltraHDR parameters.** Following Android's HDR image format and Apple's
    documented HDR effect, we set `offset_hdr = offset_sdr = 0`,
@@ -440,14 +444,21 @@ which is the correct behaviour rather than a failure.
 - **Non-Apple HEIC inputs.** As §5.3 shows, a HEIC without an Apple gain map yields a
   plain JPEG. This is correct, but it means a mixed input directory produces a mixed
   output directory.
-- **Gain map transfer function.** Apple's documentation states that the gain map is
-  encoded with the Rec.709 transfer function, whereas this implementation linearises it
-  with the inverse sRGB EOTF (`src/i2a/convert.rs:146-152`). The two are not the same
-  function: they differ in breakpoint (0.04045 against 0.081) and exponent (2.4 against
-  approximately 2.222), diverging by roughly 20% at mid-range values. Which function
-  Apple's encoder actually applies could not be established from the published
-  documentation alone, and no independent HDR reference was available to settle it
-  empirically. The discrepancy is recorded here rather than resolved.
+- **Gain map transfer function.** Apple's documentation specifies the Rec.709 transfer
+  function, and this implementation applies its inverse. The inverse sRGB EOTF is a
+  plausible alternative and was used here until it was measured. The two differ in
+  breakpoint (0.081 against 0.04045) and exponent (approximately 2.222 against 2.4):
+  the linearised value they produce differs by 21% at u = 0.5, and by considerably more
+  further down — a factor of 2.9 in the linear segment below the breakpoint. Those
+  figures overstate the visible consequence, because the log-recovery mapping that
+  follows compresses them. Across 60 photographs sampled from a real library the two
+  choices disagree on 95% of pixels (mean 11.5 of 255 levels, maximum 17) yet shift the
+  reconstructed HDR luminance by only 0.08–0.16 stops — consistently brighter with
+  Rec.709, never darker — and a side-by-side comparison on an HDR display does not
+  distinguish them. Rec.709 is used because it is the documented behaviour; **which
+  function Apple's encoder actually applies remains unestablished**, since no
+  independent reference was available to settle it. See §3.2 for the formula and
+  `notes/hdr-formats-research.md` (A.7, A.8.1) for the measurement.
 - **No `hdrgm` XMP in the output.** Outputs carry ISO 21496-1 metadata in an APP2 segment
   but no `hdrgm` XMP packet. Android's documentation recommends writing both and
   preferring the binary form when decoding, so conforming decoders should read the

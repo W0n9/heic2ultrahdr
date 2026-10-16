@@ -74,7 +74,11 @@ Apple 的公开定义只存在于一篇第一方开发者文档：**“Applying 
 
 > The result of applying the gain map is a linear HDR image with a scale where 1.0 is the reference white and the peak value is no greater than the headroom value.
 
-【实现】本仓库 `src/i2a/convert.rs:107-108` 与 `146-152` 对 gain map 做的是 **sRGB EOTF 的反变换**（`reverse_srgb_transform`：`u <= 0.04045 ? u/12.92 : ((u+0.055)/1.055)^2.4`），而 Apple 文档写的是 “Rec.709 transfer function”。两者不是同一个函数（分段点与指数都不同）。此处只记录「文档说法」与「实现做法」的差异，不断言哪个更正确；若要写进报告，建议表述为「实现采用了 sRGB 传递函数近似」。
+【实现】调研当时，本仓库 `src/i2a/convert.rs` 对 gain map 做的是 **sRGB EOTF 的反变换**（`reverse_srgb_transform`：`u <= 0.04045 ? u/12.92 : ((u+0.055)/1.055)^2.4`），而 Apple 文档写的是 “Rec.709 transfer function”。两者不是同一个函数（分段点与指数都不同）。
+
+> **已变更（2026-10-16）**：实测后本仓库已改用 **Rec.709 反变换**（`reverse_rec709_transform`），并以单元测试钉住期望值。理由与实测数据见 A.8.1。下方 A.6.1 记录的「继承自 `apple-hdr-heic` 的 sRGB 选择」是变更前的状态。
+
+> **后续调研（A.5–A.8）**：这条差异的完整取证见 A.5（Apple 侧 API 与可用性）、A.6（六个独立实现各用什么函数）、A.7（有没有人实测过）、A.8（结论与实测方案），以及 B.8（ISO 21496-1 是否规定 gain map 像素的传递函数）。
 
 【规范】Apple 文档同页还给出应用公式的语义边界：结果线性 HDR 图的峰值不超过 headroom。
 
@@ -154,6 +158,477 @@ let headroom = pow(2.0, max(stops, 0.0))
 
 【实现】ISO 项目时间线（见 B.4）显示 “New project approved 2023-07-06”，与 Apple 该注记的 “as of April 2023” 在时间上衔接。
 
+### A.5 `kCGImageAuxiliaryDataTypeISOGainMap`、Apple 官方用法，以及无显示器环境下的第一方参照路径
+
+本节回答「Q1」：两个 gain map 辅助图常量各自的可用性门槛与语义、Apple 官方怎么用它们，以及能否在无显示器的 macOS runner 上拿到 Apple 侧的参照像素。
+
+#### A.5.1 可用性门槛
+
+【规范】Apple 文档元数据中的 `platforms` 字段（`introducedAt`，逐字）：
+
+| 常量 | iOS | iPadOS | Mac Catalyst | macOS | tvOS | visionOS | watchOS |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `kCGImageAuxiliaryDataTypeHDRGainMap` | 14.1 | 14.1 | 14.1 | 11.0 | 14.0 | 1.0 | 7.0 |
+| `kCGImageAuxiliaryDataTypeISOGainMap` | 18.0 | 18.0 | 18.0 | **15.0** | 18.0 | 2.0 | 11.0 |
+
+【推断】Apple 的 `introducedAt` 语义是「自该版本起可用」，故 **macOS 15.0 及以上（含 macOS 26）都能调用 `kCGImageAuxiliaryDataTypeISOGainMap`**。本仓库 release CI 的 macOS 任务是 `- { os: macos-26, arch: arm64 }`（`.github/workflows/release.yml:29`），已满足该门槛。
+
+#### A.5.2 官方文档对这两个常量说了什么——以及它没说什么
+
+【规范】`kCGImageAuxiliaryDataTypeHDRGainMap` 的 abstract 是其文档页上唯一一句说明：
+
+> The type for High Dynamic Range (HDR) gain map information.
+
+【规范】`kCGImageAuxiliaryDataTypeISOGainMap` 的文档页**没有任何说明文字**：其文档 JSON 的 `abstract` 为 `null`，`primaryContentSections` 只含 `declarations`（即 `let kCGImageAuxiliaryDataTypeISOGainMap: CFString`），`sections` 为空数组——该页除声明与可用性表外没有 Discussion 段。
+
+【推断】A.1 中「两个常量并存说明 Apple 在 SDK 层面区分两种辅助图」**至今仍只是推断**：Apple 从未在 API 参考里解释 `kCGImageAuxiliaryDataTypeISOGainMap` 的语义。官方解释只出现在 WWDC24 的 session 里（见 A.5.3）。
+
+#### A.5.3 Apple 官方怎么用它：WWDC24 session 10177
+
+【规范】WWDC24 session **10177**（*Use HDR for dynamic image experiences in your app*）字幕原文（节选）：
+
+> With the release of iOS 18, we are transitioning to Adaptive HDR Gain Maps and related metadata. This new generation is based on the latest draft.
+
+> Last year we introduced the CIImage option expandToHDR to support the Apple Gain Map image format. This same API now also works to read Adaptive HDR files.
+
+> This option is also available via the ImageIO API kCGImageSourceDecodeToHDR.
+
+> To use the SDR and Gain approach, load both the SDR and Gain Map components of the file as two in-memory image objects. Use the auxiliaryHDRGainMap option to load the Gain Map from a file as a CIImage object.
+
+> Note that the Gain image is typically half the size of the SDR image so edits need to account for the scale difference.
+
+【规范】同一 session 给出**写入** ISO gain map 的官方路径：
+
+> Lastly, your app can use ImageIO to save an SDR CGImage and Gain Map data. The first step is to call CGImageDestinationAddImage with an SDR CGImage with an SDR CGColorSpace. The next step is to create a dictionary that describes the Gain Map. This should contain the actual pixel data of the Gain Map, a sub-dictionary that describes the height, width, and format of that data and a CGImageMetadata that describes how the pixel data should be converted to linear gain values. In most cases you can re-use the CGImageMetadata from the source file. Then, all that is needed is to call CGImageDestinationAddAuxiliaryDataInfo and pass the new kCGImageAuxiliaryDataTypeISOGainMap key and the info dictionary.
+
+【推断】由此可确定两者的分工：`kCGImageAuxiliaryDataTypeHDRGainMap` 对应 2020 年起 iPhone 拍摄的 **Apple Gain Map**（Rec.709 编码 + 单一 headroom，见 A.2）；`kCGImageAuxiliaryDataTypeISOGainMap` 对应 iOS 18 起 Apple 转向的 **Adaptive HDR / ISO 21496-1** gain map（B 节）。session 明说后者 “based on the latest draft”，且转写发生在 iOS 18。
+
+【规范】`CIImage.applyingGainMap(_:)`（macOS 15.0+）文档给出了取 gain map 的官方写法与一个静默失败条件：
+
+> The gain map image can be obtained by creating a `CIImage` instance from `NSURL`/`NSData` and setting the `auxiliaryHDRGainMap` option set to `@YES`.
+
+> If the gain map `CIImage` instance doesn’t have the needed `properties` metadata, the received image will be returned as-is.
+
+【推断】第二句意味着：**只拿到 gain map 的像素还不够，还必须带上它的 `properties`（即 Apple 那份 XMP/gain map 元数据）**，否则 `applyingGainMap` 不报错、直接原样返回 SDR 图。任何以 CoreImage 为参照的实测都必须断言输出与输入不同，否则会把「静默不生效」误判成「结果一致」。
+
+#### A.5.4 它返回编码域还是已线性化的数据
+
+【规范】Apple 那篇文章把「取数」与「线性化」写成两个独立步骤，且把 API 取到的数据与 URN 路径取到的数据等同：
+
+> Get the existing HDR gain map from the image's auxiliary data using the `urn:com:apple:photo:2020:aux:hdrgainmap` image data type. The gain map is untagged and formatted as linear data. It's encoded using the Rec.709 transfer function and is 1/4 the resolution of the original image.
+
+> For example, using Apple APIs, you can extract the gain map from a `CGImage` object by passing `kCGImageAuxiliaryDataTypeHDRGainMap` to the `CGImageSourceCopyAuxiliaryDataInfoAtIndex` function.
+
+> 2. Linearize the gain map by inverting the gain map gamma using the Rec.709 transfer function.
+
+【推断】这段把「用 API 取到的那份数据」与「Rec.709 编码的那份数据」等同起来，即 **`CGImageSourceCopyAuxiliaryDataInfoAtIndex(..., kCGImageAuxiliaryDataTypeHDRGainMap)` 返回的是编码域（Rec.709 传输函数编码后）的原始像素，线性化是调用方的责任**。需要指出该句自身有内在张力：“formatted as linear data” 与 “encoded using the Rec.709 transfer function” 不能同时按字面成立（Rec.709 传输函数是分段幂函数，非线性）；按上下文，“linear data” 应理解为「untagged、无 ICC 的单通道标量数据」，“encoded using the Rec.709 transfer function” 才是对像素值的操作性描述。这是【推断】，Apple 没有明说如何消解这个张力。
+
+【规范】WWDC24 对 ISO gain map 的对应说法指向同一结论——元数据的作用是「描述像素如何转成线性增益值」，即存储的像素本身不是线性的：
+
+> … and a CGImageMetadata that describes how the pixel data should be converted to linear gain values.
+
+【实现】WebKit 是目前能找到的、公开调用这两个常量的非 Apple 代码，其取数方式提供了额外线索（`Source/WebCore/platform/graphics/cg/ImageDecoderCG.cpp`，`ImageDecoderCG::frameGainMapAtIndex()`）：
+
+```cpp
+CFDictionarySetValue(auxiliaryOptions.get(), kCGImageAuxiliaryDataRepresentation, kCGImageAuxiliaryDataRepresentationPixelBuffer);
+
+RetainPtr auxiliaryInfo = adoptCF(CGImageSourceCopyAuxiliaryDataInfoAtIndexWithOptions(m_nativeDecoder.get(), index, kCGImageAuxiliaryDataTypeISOGainMap, auxiliaryOptions.get()));
+if (!auxiliaryInfo)
+    auxiliaryInfo = adoptCF(CGImageSourceCopyAuxiliaryDataInfoAtIndexWithOptions(m_nativeDecoder.get(), index, kCGImageAuxiliaryDataTypeHDRGainMap, auxiliaryOptions.get()));
+...
+RetainPtr metadata = dynamic_cf_cast<CGImageMetadataRef>(CFDictionaryGetValue(auxiliaryInfo.get(), kCGImageAuxiliaryDataInfoMetadata));
+RetainPtr gainMapPixelBuffer = dynamic_cf_cast<CVPixelBufferRef>(CFDictionaryGetValue(auxiliaryInfo.get(), kCGImageAuxiliaryDataInfoPixelBuffer));
+RetainPtr colorSpace = dynamic_cf_cast<CGColorSpaceRef>(CFDictionaryGetValue(auxiliaryInfo.get(), kCGImageAuxiliaryDataInfoColorSpace));
+```
+
+三点【实现】观察：
+
+1. WebKit **先试 ISO、失败再回落 Apple**，方向与 Android 规范「两种元数据共存时优先 ISO」（B.1）一致；
+2. 它用的是带 options 的变体 `CGImageSourceCopyAuxiliaryDataInfoAtIndexWithOptions` 加 `kCGImageAuxiliaryDataRepresentationPixelBuffer`，从而拿到 `CVPixelBuffer`；这两个键**不在公开的 `CGImageSource.h` 里**（我读到的 iPhoneOS18.0 SDK 头文件中没有这两个符号），在 developer.apple.com 上也没有对应文档页，属于未公开键；
+3. 取回的 gain map **带一个可选 `CGColorSpace`**。
+
+【推断】若 Apple 已经替调用方完成线性化，返回的 `CGColorSpace` 理应是一个线性空间；它作为「可选 color space」随像素一起返回，更像是在标注「这 8-bit 像素属于哪个色彩空间」。但 WebKit 代码没有说明该 color space 具体是什么，Apple 也没有文档描述这条带 options 的路径。因此**「ImageIO/CoreImage 是否已经替调用方线性化」无法从公开一手资料定论**，只能靠实测（把 API 返回的字节与文件内 gain map 码流的解码结果逐字节比对）回答。
+
+#### A.5.5 无显示器 macOS runner 上能否拿到 Apple 侧参照像素
+
+【规范】可用的第一方入口（可用性取自各页 `introducedAt`）：
+
+| API | macOS 可用性 | 文档原文 / 头文件注释 |
+| --- | --- | --- |
+| `CIImage(contentsOf:options: [.expandToHDR: true])` | 14.0+ | “A Boolean value that indicates whether to read Gain Map HDR images as HDR.” |
+| `kCGImageSourceDecodeRequest` = `kCGImageSourceDecodeToHDR` | 14.0+ | `kCGImageSourceDecodeRequest - value is one of the predefined keys (kCGImageSourceDecodeToHDR, kCGImageSourceDecodeToSDR, ...)` |
+| `CIImage(data:options: [.auxiliaryHDRGainMap: true])` | 11.0+ | 见 A.5.3（session 10177 与 Apple 论坛 DTS 回复均用此法） |
+| `CIImage.applyingGainMap(_:)` | 15.0+ | “Create an image that applies a gain map Core Image image to the received Core Image image.” |
+| `CIContext.render(_:toBitmap:rowBytes:bounds:format:colorSpace:)` | 10.4+ | “Renders to the given bitmap.” |
+
+【规范】CoreImage 的默认工作色彩空间是线性的：
+
+> The default working space is the extended sRGB color space with linear gamma.
+
+【推断】这条默认值是「无显示器也能拿参照」的关键：`CIContext` 是渲染器而非显示层，`render(_:toBitmap:...)` 把结果直接写进调用方提供的缓冲区，不需要任何 window/display；只要目的 `CGColorSpace` 与 `CIFormat`（如 `.RGBAh` / `.RGBAf`）取扩展线性空间，读回的浮点值就是 Apple 解码链给出的线性 HDR 值。`kCGImageSourceDecodeToHDR` 这条路同样不需要显示器（走 ImageIO 解码器），拿到 `CGImage` 后画进 `CGColorSpace.extendedLinearDisplayP3` 的浮点 `CGContext` 即可读出参照像素。
+
+【规范】一个会改变「参照值」定义的细节（SDK 头文件注释，拼写照录）：
+
+> kCGImageSourceGenerateImageSpecificLumaScaling - generate a global tone mapping function based on the gain map. Dafault value is "YES" (kCFBooleanTrue)
+
+【推断】即 `kCGImageSourceDecodeToHDR` **默认会基于 gain map 生成一条全局 tone mapping 曲线**，读回的值因此未必是「SDR × 纯 gain map」的裸结果，而是经 Apple 自选曲线映射后的结果。若要复现 Apple 的 gain map 数学，应把该选项置为 `kCFBooleanFalse`，或改走 `.auxiliaryHDRGainMap` + `applyingGainMap(_:)`。此条**未实测**，仅作为待验证项记录。
+
+【推断】以下风险必须在 runner 上实测才能定：
+
+1. GitHub 的 `macos-26` 是虚拟化环境，Metal 设备可能不可用。`CIContext` 在无 Metal 时是否自动回落、`useSoftwareRenderer`（其文档只写 “This option has no effect if the platform does not support OpenCL.”）能否覆盖，均**未验证**。相较之下 `CGImageSource` + `CGContext`（CoreGraphics）路径是纯 CPU 的，风险更低。
+2. `expandToHDR` / `kCGImageSourceDecodeToHDR` 对**2020 年格式的 Apple gain map HEIC**（而非 ISO/Adaptive 文件）是否生效：session 10177 说 `expandToHDR` “support the Apple Gain Map image format”，方向上支持，但 macOS 26 上的实际行为**未实测**。
+3. 色域：本仓库断言输入为 Display P3（`src/i2a/convert.rs:253-257`），参照路径必须以 Display P3 的扩展线性空间读回，否则会引入色彩管理差异，使比对结果失去意义。
+
+### A.6 各独立实现线性化 Apple gain map 时用的是哪个函数
+
+本节回答「Q3」。逐个读源码确认。结论先行（下表每行的依据见下文）：
+
+| 实现 | 是否处理 Apple gain map | 对 gain map **像素**用的函数 | 出处 |
+| --- | --- | --- | --- |
+| `johncf/apple-hdr-heic` | 是（唯一完整实现） | **sRGB EOTF**（`colour.models.eotf_sRGB`） | `src/apple_hdr_heic/lib.py:38-43` |
+| `strukturag/libheif` | 只取出辅助图，不解释语义 | 无 | 全仓库 843 个文件无 gainmap 命名 |
+| `monogrid/gainmap-js` | 否（只做 Adobe/ISO 一路） | 无（只实现 ISO 数学） | `src/decode/**/GainMapDecoderMaterial.ts` |
+| `darktable` | 否 | 无 | 全仓库 2360 个文件无 gainmap 命名 |
+| `ImageMagick` | 否 | 无（全部委托 libultrahdr） | `coders/uhdr.c`、`coders/heic.c` |
+| `AOMediaCodec/libavif` | 是（只做元数据换算） | **不做任何传递函数**，像素原样搬运 | `apps/shared/avifjpeg.c` |
+
+#### A.6.1 `johncf/apple-hdr-heic` —— sRGB EOTF
+
+【实现】`src/apple_hdr_heic/lib.py` 的 `apply_hdrgainmap()` 原文（含注释）：
+
+```python
+# note: Display P3 and sRGB have the same EOTF
+dp3_sdr_linear = colour.models.eotf_sRGB(dp3_sdr)
+assert dp3_sdr.shape[:2] == hdrgainmap.shape
+assert headroom >= 1.0
+hdrgainmap_linear = colour.models.eotf_sRGB(hdrgainmap)
+scale_factor_map = 1.0 + (headroom - 1.0) * hdrgainmap_linear  # between 1.0 and headroom
+dp3_hdr_linear = dp3_sdr_linear * scale_factor_map[:, :, None]
+```
+
+【实现】它对 SDR 图与 gain map 用的是**同一个** `colour.models.eotf_sRGB`，理由写在注释里：「Display P3 and sRGB have the same EOTF」。
+
+【实现】`colour.models.eotf_sRGB` 的实现（`colour/models/rgb/transfer_functions/srgb.py`）原文，docstring 自述为 “Apply the *IEC 61966-2-1:1999* *sRGB* electro-optical transfer function (EOTF).”：
+
+```python
+L = xp.where(
+    eotf_inverse_sRGB(0.0031308) >= V,
+    V / 12.92,
+    spow((V + 0.055) / 1.055, 2.4),
+)
+```
+
+【推断】`eotf_inverse_sRGB(0.0031308)` 即 0.04045…，故该函数与**调研当时**本仓库的 `reverse_srgb_transform` **逐字等价**（同为分段点 0.04045、指数 2.4），而不是 Rec.709 传输函数（分段点 0.081、指数 1/0.45≈2.222）。本仓库在 `src/i2a/convert.rs:29` 只致谢了该项目的 metadata 读取逻辑，但传输函数的选择与之一致——**本仓库当时的 sRGB 反变换并非孤立选择，它继承了 `apple-hdr-heic` 的做法**。该选择已于 2026-10-16 改为 Rec.709，见 A.8.1。
+
+【推断】该实现给出的理由是「Display P3 与 sRGB 有相同 EOTF」。这句话本身成立（Display P3 与 sRGB 共用 sRGB 传输函数，只差 primaries），但它回答的是「SDR 主图该用哪个 EOTF」，**不是**「Apple 的 gain map 用哪个传输函数」——把 SDR 图的前提推广到 gain map 上，是一个未经论证的跳跃。Apple 文档对 gain map 明确写的是 Rec.709（A.2）。
+
+#### A.6.2 `strukturag/libheif` —— 不解释 gain map
+
+【实现】`strukturag/libheif` 主分支全仓库 843 个文件中，路径含 `gainmap` / `gain_map` / `hdrgain` 的为 **0 个**。公共辅助图头 `libheif/api/libheif/heif_aux_images.h` 只提供通用的 auxiliary image 访问 API，文件内不含 `gain` / `hdr` / `urn` 任何字样。
+
+【推断】libheif 能**取出** Apple gain map（本仓库正是走这条路，`src/i2a/convert.rs:70-89`），但不解释其语义，也不做任何反变换；因此它不构成「第三种取法」，也就无法为传输函数之争提供证据。
+
+#### A.6.3 `monogrid/gainmap-js` —— 只做 Adobe/ISO 一路
+
+【实现】仓库 281 个文件中，含 `gainmap` 命名的源码全部属于 Adobe/ISO 一路；README 自述为 “A Javascript (TypeScript) Encoder/Decoder Implementation of Adobe's Gain Map Technology for storing HDR Images using an SDR Image + a "Gain Map"”。
+
+【实现】其 JPEG 提取函数 `src/decode/shared/extract.ts` 只走 XMP + MPF，无 Apple URN 分支：
+
+```ts
+export const extractGainmapFromJPEG = async (jpegFile: Uint8Array<ArrayBuffer>) => {
+  const metadata = extractXMP(jpegFile)
+  if (!metadata) throw new XMPMetadataNotFoundError('Gain map XMP metadata not found')
+
+  const mpfExtractor = new MPFExtractor({ extractFII: true, extractNonFII: true })
+  ...
+}
+```
+
+【实现】解码 shader（`src/decode/webgl/materials/GainMapDecoderMaterial.ts`）只实现 ISO 数学，gain map 像素的唯一处理是 `map_gamma` 反变换：
+
+```glsl
+vec3 logRecovery = pow( recovery, gamma );
+...
+vec3 hdrColor = (rgb + offsetSdr) * exp2( logBoost * weightFactor ) - offsetHdr;
+```
+
+（uniform 侧传入 `1.0 / gamma[i]`，对应 B.3 的 `log_recovery = pow(recovery, 1.0 / map_gamma)`。）
+
+【推断】gainmap-js 没有 Apple gain map 分支，对本题无直接证据；但它说明「Adobe/ISO 阵营的实现只处理 `map_gamma`，从不假设 gain map 像素带有额外传输函数」这一惯例（与 B.1/B.2 的规范一致）。
+
+#### A.6.4 `darktable` —— 完全没有 gain map
+
+【实现】`darktable-org/darktable` 主分支 2360 个文件中，路径含 `gainmap` / `gain_map` / `hdrgain` 的为 **0 个**。`src/imageio/imageio_heif.c` 与 `src/imageio/imageio_avif.c` 中与 HDR/传递函数相关的代码只有 CICP 标注，例如：
+
+```c
+/* mistagged Rec. 709 AVIFs exported before dt 3.6 */
+if(... && profile_info_nclx->matrix_coefficients == heif_matrix_coefficients_ITU_R_BT_709_5)
+{
+  /* must be actual Rec. 709 instead of 2.2 gamma*/
+  cicp->transfer_characteristics = (uint16_t)heif_transfer_characteristic_ITU_R_BT_709_5;
+}
+```
+
+【实现】这段是对「darktable 3.6 之前导出的 AVIF 把 Rec.709 误标成 gamma 2.2」的历史 bug 的修正，与 gain map 无关。darktable 既不解码也不应用 Apple gain map。
+
+#### A.6.5 `ImageMagick` —— 全部委托 libultrahdr
+
+【实现】`coders/uhdr.c`（2172 行）是 libultrahdr 的封装：所有 gain map 数学都通过 `uhdr_*` C API 完成，文件自身只处理 base/HDR 图的颜色传输选择（`UHDR_CT_LINEAR` / `UHDR_CT_SRGB` / PQ / HLG，见 `map_ct_to_uhdr_ct()`）与 hdrgm 属性的读写。全文件不含 `apple` / `HDRGainMap` 字样。
+
+【实现】`coders/heic.c`（2770 行）中与 auxiliary image / gain map 相关的匹配为 **0 处**。
+
+【推断】ImageMagick 既不解码 Apple gain map，也就没有传输函数选择；它的 HDR 能力完全等于 libultrahdr 的能力。
+
+#### A.6.6 `AOMediaCodec/libavif` —— 有 Apple 分支，但不碰像素
+
+【实现】`apps/shared/avifjpeg.c` 中唯一处理 Apple 格式的函数是 `avifJPEGParseGainMapXMPPropertiesAppleFormat()`（第 797-826 行），它只做**元数据换算**，原文：
+
+```c
+static avifBool avifJPEGParseGainMapXMPPropertiesAppleFormat(const xmlNode * descNode, avifGainMap * gainMap)
+{
+    double hdrHeadroomLinear = 1.0;
+    AVIF_CHECK(avifJPEGFindGainMapPropertyDoubles(descNode, "HDRGainMapHeadroom", &hdrHeadroomLinear, /*numDoubles=*/1, XML_NAME_SPACE_APPLE_GAIN_MAP));
+    if (hdrHeadroomLinear <= 0) {
+        return AVIF_FALSE;
+    }
+    const double hdrHeadroom = log2(hdrHeadroomLinear);
+    ...
+    for (int i = 0; i < 3; ++i) {
+        gainMap->gainMapMin[i].n = 0; // Min = 0 (log2)
+        gainMap->gainMapMin[i].d = 1;
+        gainMap->gainMapMax[i] = hdrHeadroomSFraction;
+        gainMap->gainMapGamma[i].n = 1; // Gamma = 1.
+        gainMap->gainMapGamma[i].d = 1;
+        gainMap->baseOffset[i].n = 0; // Base offset = 0.
+        gainMap->baseOffset[i].d = 1;
+        gainMap->alternateOffset[i].n = 0; // Alternate offset = 0.
+        gainMap->alternateOffset[i].d = 1;
+    }
+    gainMap->baseHdrHeadroom.n = 0; // Base headroom = 0 (SDR)
+    gainMap->baseHdrHeadroom.d = 1;
+    AVIF_CHECK(avifDoubleToUnsignedFraction(hdrHeadroom, &gainMap->alternateHdrHeadroom));
+    return AVIF_TRUE;
+}
+```
+
+【实现】XMP 里没有 headroom 时回落到 Exif（`avifGetExifAppleHeadroom()`，第 363-476 行），它读 MakerNote 33/48 并**逐字复刻** Apple 文档的分段公式（含四条系数），但**没有** Apple 公式里的 `max(stops, 0.0)` 钳制，且返回的是 `stops` 本身而非 `pow(2, stops)`：
+
+```c
+    *altHeadroom = stops;
+```
+
+【推断】把 `stops` 直接写进 log2 域的 `gainMapMax` / `alternateHdrHeadroom` 在数学上是对的（`log2(headroom) = stops`），但与 XMP 路径相比少了 `max(stops,0)` 钳制，负 stops 会得到负的 log2 headroom。这条差异未见 libavif 有说明或测试覆盖。
+
+【实现】gain map 图像被**原样**赋给 `gainMap->image`，其间没有任何传递函数（`avifJPEGExtractGainMapImage()`，第 1124 行）：
+
+```c
+            gainMap->image = image;
+            return AVIF_TRUE;
+```
+
+【实现】同文件第 1614-1616 行的 `AVIF_TRANSFER_CHARACTERISTICS_PQ` 只作用于 **alternate（HDR）图像的输出标注**，不是 gain map 像素的传递函数：
+
+```c
+            // Since jpeg doesn't provide this metadata, assume the values are the same as the base image
+            // with a PQ transfer curve.
+            gainMap->altColorPrimaries = avif->colorPrimaries;
+            gainMap->altTransferCharacteristics = AVIF_TRANSFER_CHARACTERISTICS_PQ;
+```
+
+【推断】**libavif 对 Apple gain map 不做任何像素传递函数**：它把 Apple 的 8-bit gain map 像素直接当作 ISO 21496-1 的 recovery 值，并令 `gainMapMin = 0`、`gainMapMax = log2(headroom)`、`gamma = 1`、offset 全 0。这与本仓库的重参数化参数完全一致（`src/i2a/convert.rs:273-281`），**但本仓库在写入前先对像素做 sRGB 反变换再重算 recovery**（`src/i2a/convert.rs:107-122`），libavif 没有这一步。
+
+【推断】两条路线的差别恰好落在 Apple 那句自相矛盾的话的两半上：
+
+- 若 Apple 的 gain map 确实带传递函数编码（“encoded using the Rec.709 transfer function” 按字面成立），则 libavif 的 Apple→ISO 映射在数学上**不等价**于 Apple 的应用式，只是一个近似；本仓库多做的 sRGB 反变换方向是对的（但函数选错）。
+- 若 Apple 的 gain map 是无传递函数编码的（“formatted as linear data” 按字面成立），则 libavif 是对的，本仓库多做的 sRGB 反变换**引入**了误差。
+
+> **已变更（2026-10-16）**：本仓库已改用 **Rec.709 反变换**（见 A.8.1）。本节中「本仓库做 sRGB 反变换」「函数选错」等表述描述的是变更前的状态。
+
+我没有找到 libavif 就这一选择给出的任何说明、注释或测试。**这正说明该问题必须靠实测判定，而不能靠读实现投票。**
+
+### A.7 有没有人拿 Apple 的实际输出实测过
+
+本节回答「Q4」。**结论先行：没有找到任何人做过「Rec.709 vs sRGB」的受控实测对比；只找到一条以 Apple 框架输出为基准的端到端定量对比，而它没有隔离传输函数这个变量。**
+
+#### A.7.1 检索过的位置与结果（负结果也是结果）
+
+| 位置 | 是否讨论 gain map 像素的传递函数 | 是否有实测 |
+| --- | --- | --- |
+| libavif PR #2960（加入 Apple gain map 支持，2026-01 合入） | 否 | 否 |
+| libheif issue #1685（Apple HEIC gain map） | 否 | 否（评论者提到其仓库有 PSNR/体积结果，但那是端到端 PSNR，非传输函数隔离） |
+| awxkee/gainforge issue #10 | 否 | 否 |
+| m13253/heif-hdrgainmap-decode issue #3 “Wrong conversion for gain map” | 否 | 否 |
+| sam-dumont/immich-memories issue #107 | 否（讨论 headroom） | 有，但测的是 headroom / nits |
+| Apple 专利 US 2024/0153053 A1 | **否**（通篇未规定 gain map 像素的传递函数） | 否 |
+| Apple Developer Forums（含 DTS 工程师回复的 #772498、#737012、#770437） | 未找到 | 未找到 |
+| jackchou00 博客 | 是 | 有（见 A.7.2） |
+
+【规范】Apple 专利 US 2024/0153053 A1 值得单独记一笔，因为它是 Apple 关于 gain map 生成的第一方技术披露。它的 gain map 值定义**只有除法与乘法**，没有任何编码层：
+
+> dividing the value of each pixel of the multiple-channel SDR image 221 by the value of the corresponding pixel
+
+> multiplying the pixel denoted “P1,1” of the multiple-channel HDR image 211 (having a value of “5”) by the pixel denoted “P1,1” of multiple-channel gain map 231
+
+【实现】该专利全篇不含 `Rec.709` / `sRGB` / `BT.709` / `OETF` / `EOTF` / `gamma 2.2` 等任何传递函数字样，也没有描述播放端的线性化步骤。**它不能用来支持任何一侧。**（另需注意：该专利描述的是“多重增益图”的生成与调整，未必覆盖 2020 年那版单通道 Apple gain map 的编码。）
+
+【实现】libavif PR #2960（“Add support for Apple gain maps (iPhone jpegs)”，2026-01-16 由 maryla-uc 合入）的描述只涉及 XMP 语法差异与从 Exif Maker Notes 补 headroom：
+
+> These use a different XMP syntax on the gain map image, and do not carry XMP on the main image.
+
+【实现】其评审记录里没有任何关于传输函数的讨论（唯一实质评论是 vrabaud 的 “Perfect !”）。**给 libavif 加上 Apple gain map 支持的人，也没有讨论过像素传递函数。**
+
+【二手】m13253/heif-hdrgainmap-decode issue #3 是唯一一条标题直指「转换错误」的记录，但正文与回复都没有技术细节：维护者在 2024-12-14 回复称该项目启动时文档不足，“it is highly likely my conversion is wrong”，并把 README 指向 `johncf/apple-hdr-heic` 后关闭。**它既没说错在哪，也没说对的是哪个函数。**
+
+#### A.7.2 唯一一条定量对比：jackchou00 的 CoreImage 基准实验
+
+【二手】博客《HDR 图像格式解析（六）：iPhone HEIC 照片的解码与转换》（jackchou00.com，有中英双语版本）。这是目前能找到的唯一一条把「手写转换」与「Apple 框架输出」放在一起量的记录。
+
+实验的两条管线（原文代码）：
+
+- **Apple 侧**：`CIImage(contentsOf: fileURL, options: [.expandToHDR: true])`，再 `CIContext.createCGImage(hdrCIImage, from:, format: .RGBAh, colorSpace: CGColorSpace(name: .displayP3_PQ)!)`；
+- **手写侧**：pillow-heif 提取 Baseline / Gainmap，`Exiftool` 取 headroom，按文档用 **Rec.709** 线性化 gain map、用 sRGB 线性化 SDR，再套 `hdr_rgb = sdr_rgb * (1.0 + (headroom - 1.0) * gainmap)`。
+
+核心结论原文：
+
+> 以 Core Image 的转换结果为基准，手动转换后的结果平均下来约有 1% 的差距，主要就是出现在高亮部分的截断上。
+
+作者自己同时报告了三处**无法解释的偏差**，这几条比那个 1% 更重要：
+
+> 也可以通过 Core Image 直接转换，按照 Apple 的说法，转换后的最大值不应该超过 Headroom，但 Core Image 的结果却显著超过，也许和之前提到的 Baseline Image 的范围有关。
+
+> 如果使用 Core Image 提取的三个部分，再手动的进行转换，虽然高亮部分不会截断，但结果也会存在一些偏差，尚不清楚原因。
+
+> 当 format 为 RGBA8 时，Core Image 解码后的图像范围在 0-255 之间，且大部分像素值与使用 pillow-heif 提取的图像一致，在高亮和暗部的地方会存在差异，也许是 Core Image 存在一些色调压缩的处理
+
+【推断】该实验**不能判定传输函数**，三条理由：
+
+1. 作者只做了一条手写管线（Rec.709），**没有 sRGB 对照组**，因此那个 1% 无法归因到传输函数上；
+2. 他自报的两处无法解释的偏差（CoreImage 输出超出 headroom、用 CoreImage 取数再手动转换仍有偏差）说明 CoreImage 端还叠加了别的处理，**基准本身不干净**；
+3. 差异「主要出现在高亮部分的截断」说明主导项是钳制，而非中段线性化。
+
+【推断】不过有一点值得记录：如果 Apple 的 gain map 实际是 sRGB 编码，而手写管线按 Rec.709 线性化，中段误差约 20%（见 A.2 的对比），经 `1 + (hr-1)*L` 传到 HDR 后仍有约 4%–7%（取 hr = 2–3、L ≈ 0.16–0.20，即 immich issue #107 观测到的典型 gain map 均值附近）。这与作者观察到的「平均约 1%、且集中在高亮截断」不太吻合。**这是一条弱到中等强度的旁证，方向偏向 Rec.709 正确**；但受上述三条方法学问题限制，**不能当作定论**。
+
+#### A.7.3 一条常被引用的旁证其实不适用：`x^1.961`
+
+【规范】Apple 论坛帖 “Why does Apple use simplified 1.961 gamma instead of precise ITU-R 709 transfer function?” 与 Apple 文档 *Evaluating an app's video color using light-measurement Instruments* 讨论的是 **Core Video 色彩配置与 macOS 显示系统**用 `f(x) = x^1.961` 近似 BT.709 传输函数：
+
+> The system uses a 1.961 gamma based on the assumption of a bright surround environment.
+
+【推断】**这条与 gain map 无关**：它解释的是视频/显示链路的色彩配置近似（`CVImageBufferCreateColorSpaceFromAttachments` 生成的自定义 profile、`vImageBuffer_CopyToCVPixelBuffer` 的 Core Video 兼容行为），不是 Apple gain map 编码器实际用的函数。把它拿来论证 gain map 传输函数是误用。**记在这里是为了防止后续调研再被它误导。**
+
+#### A.7.4 与 headroom（而非传输函数）有关的实测
+
+【二手】`sam-dumont/immich-memories` issue #107（2026-03-21 创建，同日经 PR #113 修复，commit `6f01a52`）。作者报告 HDR gain map 照片在他的管线里「比原 HEIC 更暗、更不饱和」，根因是 Apple 路径把 headroom 硬编码成 2.3（`animator.py:238`：`headroom = 2.3`）。给出的实测数据：
+
+- 测试照片：iPhone 16 Pro，5712×4284；
+- **gain map 取值范围 [83, 255]，均值 111.6**；
+- 由机型推断的 headroom：iPhone 14 Pro ≈ 3.0、iPhone 15/16 Pro ≈ 3.5–4.0；
+- 多组 npl（203 / 500 / 999）下的均值 RGB 分别为 (38,35,31) / (56,52,46) / (74,69,61)，SDR 基线为 (119,115,102)，其照片管线实际输出为 (151,146,133)。
+
+【实现】该 issue 与本题正交：它测的是 headroom 缺失，不是 gain map 像素的传递函数。但它给出两条对后续实测有用的信息：
+
+1. **真实照片的 gain map 值域可以很窄且偏高**（最小 83 而非 0），说明实测样本必须覆盖足够宽的 gain map 取值，否则两个候选函数可能都落在量化噪声内而无法区分；
+2. Apple 的 headroom 不在 XMP / gain map 元数据里（作者称已核实），需从 Exif MakerNote 或 ISO 21496-1 取——与本仓库 `src/i2a/convert.rs:28-67` 的读取优先级一致。
+
+【二手】另有一份 headroom 提取方法的三方对比（jackchou00 博客）：以 Core Image 的 `contentHeadroom` 为基准，`XMP:HDRGainMapHeadroom` 「与之最接近（但会少几位有效数字）」，Apple 文档推荐的 MakerNote 33/48 公式「有一点点偏差」。该文未给出具体数值。
+
+#### A.7.5 一条对后续实测极重要的旁证：Apple 的 API 似乎不做线性化
+
+【二手】同一条博客在比较 gain map 提取方式时写道（原语言）：
+
+> 比如 Python 中，可以用 pillow-heif 提取，结果与 Core Image 得到的是**完全一致**的。
+
+其 Core Image 侧代码把 gain map 渲染为 `format: .RGBA8`、`colorSpace: extendedLinearDisplayP3`，pillow-heif 侧则直接读 `urn:com:apple:photo:2020:aux:hdrgainmap` 辅助图的原始字节。
+
+【推断】若 CoreImage 在取出 gain map 时应用了任何传递函数，渲染成 8-bit 后不可能与文件里的原始码值逐字节一致。因此这条旁证指向：**CoreImage 的 `.auxiliaryHDRGainMap` 返回的就是未线性化的编码域像素，与 Apple 文档要求的「由调用方线性化」一致**。这同时回答了 A.5.4 留下的问题（方向为「返回编码域」），但**这是第三方博客的一句断言，没有附逐字节证据**，只能算【二手】，必须用 A.8 的步骤 2 自行复核。
+
+### A.8 结论：这件事能否靠读一手资料定论
+
+**不能定论。** 按三个不同命题分开陈述（这正是 issue #1 困境的根源——把 (a) 当成了 (b)）：
+
+**(a) Apple 文档建议开发者怎么做** —— **有明确答案，无歧义。** 用 **Rec.709 传输函数的反函数**线性化 gain map，用图像自身色彩空间的传递函数线性化 SDR 图，再套 `hdr = sdr * (1 + (headroom-1) * gainmap)`（A.2）。这是【规范】级结论。
+
+**(b) Apple 自己的编解码器/渲染器实际怎么做** —— **无一手资料可查，且现有证据互相牵制。**
+
+- Apple 从未说明 `CGImageSourceCopyAuxiliaryDataInfoAtIndex(..., kCGImageAuxiliaryDataTypeHDRGainMap)` 或 CoreImage 取出的像素是否已被线性化（A.5.2、A.5.4）；
+- Apple 专利 US 2024/0153053 A1 通篇不含传递函数（A.7.1）；
+- WWDC24 session 10177 只讲 API 用法，不讲像素编码（A.5.3）；
+- 唯一一条旁证（A.7.5）指向「API 返回编码域像素、不代做线性化」，但只是第三方的一句断言；
+- 而**编码器当时究竟用了 Rec.709 还是 sRGB，至今没有任何一手来源**。
+
+**(c) 各独立实现怎么做** —— **三个实现给出三个不同答案，且没有一个是实测得出的**：
+
+| 实现 | gain map 像素用什么 | 依据 |
+| --- | --- | --- |
+| `johncf/apple-hdr-heic` | sRGB EOTF | 自定（注释只说 “Display P3 and sRGB have the same EOTF”） |
+| `jackchou00/hdr-conversion` | Rec.709 | 照抄 Apple 文档，README 自称「可能不正确」 |
+| `AOMediaCodec/libavif` | 不做任何传递函数 | 未说明理由，无测试 |
+
+其余实现（libheif / darktable / ImageMagick / gainmap-js）根本不处理 Apple gain map（A.6）。**所以「多数实现怎么做」这个问题没有意义——不存在多数。**
+
+#### 实测参照最可行的一条路径
+
+**首选：以「gain map 平面本身」为参照，而不是以「Apple 渲染出的 HDR 图」为参照。**
+
+理由：A.7.2 的实测显示 CoreImage 的最终 HDR 输出叠加了额外处理（超出 headroom、用 Apple 取数再手动转换仍有无法解释的偏差），不适合做数学基准；而 gain map 平面本身在 CoreImage 与 pillow-heif 之间被报告为逐像素一致，干净得多。
+
+具体步骤（全部需要 macOS 11+ 即可，**不需要 macOS 15+**；`macos-26` 满足）：
+
+1. **平台**：`macos-26` runner（`.github/workflows/release.yml:29`），无需显示器。
+2. **取 Apple 侧 gain map 原始字节**：`CGImageSourceCopyAuxiliaryDataInfoAtIndex(src, 0, kCGImageAuxiliaryDataTypeHDRGainMap)`（macOS 11.0+，纯 ImageIO，不碰 Metal）。把它与仓库自己用 libheif 解出的 gain map 平面**逐字节比对**——这一步直接回答「Apple 的 API 是否已线性化」，且完全不依赖 GPU。
+3. **取 Apple 侧 HDR 参照值**：`CGImageSourceCreateImageAtIndex` 配 `[kCGImageSourceDecodeRequest: kCGImageSourceDecodeToHDR]`（macOS 14.0+），画进 `CGColorSpace.extendedLinearDisplayP3` 的浮点 `CGContext`（纯 CPU）。**建议同时把 `kCGImageSourceGenerateImageSpecificLumaScaling` 置为 `kCFBooleanFalse`**，以关掉 ImageIO 基于 gain map 生成的全局 tone mapping（A.5.5），否则测到的是 Apple 的 tone mapping 而不是 gain map 数学。
+4. **拟合**：对同一批像素，分别用 Rec.709 反函数与 sRGB 反函数算出 `hdr = sdr * (1 + (hr-1)*L)` 的预测值，与步骤 3 的参照值做残差比较。样本要挑 gain map 取值覆盖中段的区域（A.7.4 提醒真实照片 gain map 值域可能窄且偏高，中段样本是关键）。
+5. **次选（仅当步骤 3 的 CoreGraphics 路径不可用时）**：CoreImage `applyingGainMap(_:headroom:)`（macOS 15.0+，显式接收 headroom，比 `applyingGainMap(_:)` 可控）。但必须处理两个坑：gain map `CIImage` 必须带 `properties`，否则**静默返回原图**（A.5.3）；以及虚拟化 runner 上 Metal 可能不可用（A.5.5）。
+
+**必须靠实测才能回答的问题**（读一手资料解决不了）：
+
+1. Apple 的 gain map 编码器实际用的是 Rec.709、sRGB，还是别的函数？
+2. `CGImageSourceCopyAuxiliaryDataInfoAtIndex` / CoreImage `.auxiliaryHDRGainMap` 返回的到底是不是未线性化的原始像素？（A.7.5 倾向「是」，需逐字节确认）
+3. CoreImage 的最终 HDR 渲染除 gain map 数学外还叠加了什么，使得结果超出 headroom？
+4. 两个候选函数在**真实 iPhone 照片**上的端到端差异有多大，是否落在 8-bit 量化噪声之内（即：这个差异对最终产物是否真的可见）？
+
+【推断】第 4 条决定了这件事值不值得改：如果差异落在量化噪声内，issue #1 的「记录而非解决」就是正确的工程决策；如果不在，则需要按实测结果切换函数。
+
+#### A.8.1 第 4 条已实测（2026-10-16）
+
+【实现】在本仓库代码里对两条路各算一遍并量化到 8-bit，语料为 `iCloud 照片/` 跨库均匀抽样的 60 张真实照片（每 8 张取 1 张，避免集中在同一次拍摄）：
+
+| 指标 | 结果 |
+| --- | --- |
+| 有差异的像素比例 | 平均 95.24%（最低 7.61%，最高 100%） |
+| max_delta | 平均 15.2 LSB，最高 17 LSB |
+| mean_delta | 平均 11.49 LSB |
+| gain 域单张最大差 | 平均 0.1012 stop，全局最大 0.1617 stop |
+| gain 域单张平均差 | 平均 0.0802 stop |
+
+【实现】结论分两层，两者并不矛盾：
+
+1. **数值上差异真实。** 8-bit 舍入的量化噪声量级是 ±0.5 LSB，实测平均 11–15 LSB，是噪声的 20–30 倍。第 4 条设想的「落在量化噪声内」不成立。
+2. **感知上差异不可见。** `log_recovery → pixel_gain` 是指数映射，把差异大幅压缩：显示域平均差 3–5 级、峰值 9–11 级（满量程 255），即约 1.5% 平均、4% 峰值亮度偏移，合 0.08–0.16 stop。在 headroom 最高的 4 张（5.46–5.84）上做并排对比，HDR 显示设备上分不出。
+
+【实现】差异是**单向**的：在 u ∈ (0, 1) 上恒有 `r709(u) > sRGB(u)`（仅两个端点相等），实测在显示域亦然——Rec.709 恒不低于 sRGB。它不是噪声，而是系统性偏移。
+
+> **两个统计量不可混读。** 上表「有差异的像素比例（最低 7.61%）」是**量化域**统计：60 张全样本、gain map 量化值相差 ≥ 1 LSB 的像素占比。而下句「Rec.709 更亮 85–96%、sRGB 更亮约 0%」是**显示域**统计：仅限用于并排对比的那 4 张 headroom 最高的照片（5.46–5.84），重建 HDR 后亮度差 > 0.5 级。两者量纲不同、样本也不同，不可直接比较。
+
+> **可复现性**：本次测量的代码是一次性实验补丁（环境变量切换两个函数并统计 LSB 直方图），未随主线保留，故上表数字无法从当前 `src/` 直接复算。原始日志与语料清单在 `testoutput/exp/`（gitignored，不随仓库分发）。若需重跑，见 A.8.1 末尾的重建说明。
+
+【推断】第 4 条给出的决策依据因此失效——差异既不落在量化噪声内（「记录而非解决」的理由不成立），也看不见（「按实测结果切换函数」没有可感知的收益）。2026-10-16 的决定是：**改用 Rec.709**。理由是它是 Apple 文档写明的行为，改后代码与文档不再自相矛盾；风险为零，因为两个候选的产物在视觉上不可区分。落地时以单元测试钉住期望值（`src/i2a/convert.rs` 的 `rec709_inverse_is_pinned_at_representative_points`、`rec709_inverse_is_linear_below_the_breakpoint`、`rec709_inverse_is_not_the_srgb_one`）。
+
+【推断】第 1 条（Apple 编码器实际用哪个函数）**仍未解决**，且上述实测无法解决它——实测只说明两个候选差多少，不说明哪个对。鉴于差异不可见，未再投入 macOS 参照实验（A.8 的步骤 2–5 未执行）。
+
+【实现】副作用：本仓库输出的 HDR 在 iOS 上能正确渲染（iPhone 上实测有 HDR 效果），这为 `README.md` §6 里「输出只有 ISO 21496-1 APP2、没有 `hdrgm` XMP」那条限制补了一个 Android 之外的正面数据点。
+
+#### A.8.1.1 如何重跑这次测量
+
+实验补丁未随主线保留（它只是两个函数各算一遍再相减）。重建步骤：
+
+1. 在 `src/i2a/convert.rs` 里加一个 `reverse_rec709_transform`：`u < 0.081 ? u / 4.5 : ((u + 0.099) / 1.099).powf(1.0 / 0.45)`，保留原有 `reverse_srgb_transform`；
+2. 在 `create_gainmap_jpg` 的内层循环里对每个像素分别用两个函数算出 `encoded_recovery`，取绝对差累计成 256 桶直方图（即上表的量化域数字）；
+3. 同时累计 `gain = 1 + (hr - 1) * L` 两路之比，取 `log2(gain_a / gain_b).abs()` 的均值与最大值（即 stop 域数字）；
+4. 统计打到 stderr，语料用 `iCloud 照片/` 每 8 张取 1 张（清单见 `testoutput/exp/corpus-list.txt`），加 `-j` 并行。
+
+注意口径不同：`src/i2a/convert.rs` 里的单元测试钉的是**函数本身**的期望值，用于防回归；这次测量回答的是**差异有多大**，两者不可互相替代。
+
 ### A 节引用清单
 
 - [A-1] Apple Developer Documentation, *Applying Apple HDR effect to your photos* — https://developer.apple.com/documentation/appkit/applying-apple-hdr-effect-to-your-photos （Overview / “Extract the existing HDR gain map from the image” / “Calculate the headroom from the image metadata” / “Apply the HDR gain map to the image” 各节，含末尾 ISO/NP 21496-1 Note）
@@ -165,6 +640,22 @@ let headroom = pow(2.0, max(stops, 0.0))
 - [A-7] libavif, `apps/shared/avifjpeg.c` — https://github.com/AOMediaCodec/libavif/blob/main/apps/shared/avifjpeg.c （命名空间常量、Apple 格式解析函数）
 - [A-8] exiftool, *XMP Tags* 文档 — https://exiftool.org/TagNames/XMP.html （XMP HDRGainMap / XMP apdi / XMP hdrgm 三个标签族）
 - [A-9] 本仓库代码：`src/i2a/convert.rs`（headroom 读取与换算、gain map 反变换）
+- [A-10] Apple Developer, WWDC24 session 10177, *Use HDR for dynamic image experiences in your app* — https://developer.apple.com/videos/play/wwdc2024/10177/ （iOS 18 转向 Adaptive HDR / ISO gain map 的官方说明、`auxiliaryHDRGainMap` 与 `kCGImageSourceDecodeToHDR` 用法、`kCGImageAuxiliaryDataTypeISOGainMap` 写入路径）
+- [A-11] Apple Developer Documentation, `CIImage.applyingGainMap(_:)` — https://developer.apple.com/documentation/coreimage/ciimage/applyinggainmap(_:) （gain map 的 `properties` 缺失时静默返回原图）
+- [A-12] Apple Developer Documentation, `CIImage.applyingGainMap(_:headroom:)` — https://developer.apple.com/documentation/coreimage/ciimage/applyinggainmap(_:headroom:)
+- [A-13] Apple Developer Documentation, `CIImageOption.auxiliaryHDRGainMap` / `expandToHDR` / `kCGImageSourceDecodeRequest` / `kCGImageSourceDecodeToHDR` / `CIContextOption.workingColorSpace` / `useSoftwareRenderer` / `kCGImageDestinationPreserveGainMap` 各页（可用性与原文均取自 developer.apple.com 的文档 JSON 与 `.md` 端点；`workingColorSpace` 页给出 “The default working space is the extended sRGB color space with linear gamma.”）
+- [A-14] Apple SDK 头文件 `ImageIO.framework/Headers/CGImageSource.h`（iPhoneOS18.0 SDK）— 辅助数据键与 `kCGImageSourceDecodeRequest` / `kCGImageSourceDecodeToHDR` / `kCGImageSourceGenerateImageSpecificLumaScaling` 的注释原文
+- [A-15] WebKit, `Source/WebCore/platform/graphics/cg/ImageDecoderCG.cpp`、`Source/WebCore/platform/graphics/GainMap.h` — https://github.com/WebKit/WebKit （`ImageDecoderCG::frameGainMapAtIndex()` 对两个 gain map 常量的实际调用顺序与未公开键 `kCGImageAuxiliaryDataRepresentationPixelBuffer`）
+- [A-16] johncf/apple-hdr-heic — `src/apple_hdr_heic/lib.py`（sRGB EOTF 线性化 gain map）— https://github.com/johncf/apple-hdr-heic
+- [A-17] colour-science, `colour/models/rgb/transfer_functions/srgb.py`（`eotf_sRGB` 定义）— https://github.com/colour-science/colour
+- [A-18] Jackchou00/hdr-conversion — `src/hdrconv/convert/apple.py`（Rec.709 线性化 gain map）、`README.md` — https://github.com/jackchou00/hdr-conversion
+- [A-19] jackchou00, *HDR 图像格式解析（六）：iPhone HEIC 照片的解码与转换*（中英双语）— https://jackchou00.com/posts/iphone-heic-hdr-format/ ；英文版 https://jackchou00.com/en/posts/iphone-heic-hdr-format/ （CoreImage 基准实验、gain map 提取一致性、headroom 三方对比）
+- [A-20] AOMediaCodec/libavif PR #2960, *Add support for Apple gain maps (iPhone jpegs)* — https://github.com/AOMediaCodec/libavif/pull/2960
+- [A-21] sam-dumont/immich-memories issue #107, *fix: HDR gain map photos appear dim/desaturated compared to original HEIC* — https://github.com/sam-dumont/immich-memories/issues/107
+- [A-22] Apple 专利 US 2024/0153053 A1, *Techniques for Generating Gain Maps Based on Acquired Images* — https://patents.google.com/patent/US20240153053A1/en （全文未规定 gain map 像素的传递函数）
+- [A-23] Apple Developer Forums thread 772498, *How to access HDRGainMap from AVCapturePhoto*（DTS 工程师回复，给出 `CIImage(data:options:[.auxiliaryHDRGainMap: true])` 写法）— https://developer.apple.com/forums/thread/772498
+- [A-24] Apple Developer Forums thread 113337, *Why does Apple use simplified 1.961 gamma instead of precise ITU-R 709 transfer function?* — https://developer.apple.com/forums/thread/113337 ；Apple, *Evaluating an app's video color using light-measurement Instruments* — https://developer.apple.com/documentation/avfoundation/evaluating-an-app-s-video-color-using-light-measurement-instruments （两者均属 Core Video/显示链路，与 gain map 无关）
+- [A-25] m13253/heif-hdrgainmap-decode issue #3, *Wrong conversion for gain map* — https://github.com/m13253/heif-hdrgainmap-decode/issues/3 （维护者承认转换很可能有误，但未说明错在哪）
 
 ---
 
@@ -610,6 +1101,62 @@ struct uhdr_gainmap_metadata_frac {
 
 【推断】该二进制布局（u16 版本 ×2 + u8 flags + 分数对）是 libultrahdr 对 ISO 21496-1 元数据载荷的实现，与 FFmpeg 头文件描述的 “ISO 21496-1 gain map metadata blob” 一致（FFmpeg 的 `av_gain_map_params_from_iso21496()` 文档写明 “data payload, excluding container-specific identifiers”），但我没有 ISO 21496-1 正文可逐字比对。
 
+### B.8 ISO 21496-1 是否规定了 gain map 像素的传递函数
+
+本节回答「Q2」。**结论：我没有拿到标准原文，因此无法以原文回答；但所有免费可得的一手替代都指向同一结论——这一系格式在 gain map 像素上只有 `map_gamma` 一个自由度，不存在「像素传递函数」这个概念。**
+
+#### B.8.1 原文获取情况（如实记录）
+
+- 【规范】ISO 目录页（[B-2]）只提供 abstract 与生命周期，无正文条款（见 B.5）。
+- ISO Online Browsing Platform 的预览地址 `https://www.iso.org/obp/ui/en/#iso:std:iso:ts:21496:-1:ed-1:v1:en` 返回 **HTTP 403 Forbidden**，我未能读到任何目录、范围条款或术语定义。
+- 【二手】因此，「ISO 21496-1 正文是否规定了 gain map 像素的传递函数」**这个问题本身悬而未决**，本节以下全部内容都只能算**免费可得的一手替代**（Android 规范）与**实现**（库源码），**不等同于标准原文**。
+
+#### B.8.2 免费可得的第一方替代：Android Ultra HDR v1.1
+
+【规范】Android Ultra HDR v1.1 与 ISO 21496-1 的关系由规范自己在 Change Log 里声明（B.1）：
+
+> v1.1 — All changes in this version of the Ultra HDR specification are informational and about ISO 21496-1 compatibility. There are no changes to the actual file format.
+
+【规范】该规范对 gain map 像素的规定只有一条——**直接量化 recovery 值，不施加任何传递函数**：
+
+> The gain map is stored in a secondary image JPEG, and therefore must be encoded using 8-bit, unsigned integer values, thus in the range [0, 255]. Each value represents a `recovery(x, y)` value and is stored in one pixel of the secondary image.
+
+> `encoded_recovery(x, y) = floor(recovery(x, y) * 255.0 + 0.5)`
+
+【规范】`map_gamma` 是**唯一**作用于 gain map 存储值的整形参数：
+
+> `map_gamma` is a floating point number that must be greater than 0.0 and is chosen by the implementation.
+
+> `recovery(x, y) = pow(clamped_recovery(x, y), map_gamma)`
+
+【规范】规范明确声明 gain map 自带的色彩信息不被使用：
+
+> If present, the gain map's color profile isn't used.
+
+【规范】规范中出现的 “transfer function” / “sRGB” 全部指向**主图（SDR）**，与 gain map 无关：
+
+> `SDR(x, y)` is the linear version of the three-channel primary image, obtained by transforming to a linear version of the primary image color space. For example, from a color space with a sRGB transfer function to a linear color space that preserves sRGB color primaries.
+
+> `SDR'(x, y)` is the three-channel, non-linear (typically gamma-encoded) primary image.
+
+【实现】该规范全页**不含 “Rec.709” 字样**，也没有任何一句说 gain map 像素是 gamma 编码的。
+
+【推断】**Android Ultra HDR 规范对 gain map 像素的处理是「把 recovery 值直接量化成 8-bit」，即隐含假设 gain map 像素不带额外的传输函数编码。** 这与 Apple 文档「gain map 用 Rec.709 传输函数编码」（A.2）形成正面冲突——**这正是本仓库 issue #1 的根源**：两个格式对「gain map 像素该带不带传递函数」的前提不同，转换时必须在某处消解掉这个差异。
+
+#### B.8.3 其他免费一手旁证（实现侧）
+
+- 【实现】libultrahdr v1.4.0（[B-5]）：`lib/src/gainmapmath.cpp` 的 `encodeGain()` 是 `powf(gain_normalized, metadata->gamma[index]) * 255.0f`，解码侧只在 `metadata->gamma != 1.0f` 时做 `pow(gain.r, 1.0f / metadata->gamma)`。**除 `map_gamma` 外没有任何传递函数。**
+- 【实现】FFmpeg（[B-6]）：`libavutil/gain_map.h` 中与 gain map 存储值相关的字段说明只有一句——“Encoding gamma of the stored map values. Must be > 0.”。没有传输函数概念。
+- 【实现】libavif（A.6.6）：对 Apple gain map 也只写 `gainMapGamma = 1`，不做传递函数。
+- 【二手】Adobe 的 Gain Map 规范（[C-2]）同为 `map_gamma`（`Gamma` 字段）单一自由度，未见像素传递函数条款（C.2、C.3）。
+
+【推断】综合看，**ISO 21496-1 这一系的格式在 gain map 像素上只有 `map_gamma` 一个自由度，没有「传输函数」这个概念**。因此把 Apple 的 gain map 转成 ISO 21496-1 时，Apple 侧的传输函数必须在转换时被「吃掉」，只有两条路：
+
+1. **先把像素线性化，再重算 recovery**（本仓库的做法，`src/i2a/convert.rs:107-122`）；
+2. **直接搬运像素**（libavif 的做法，`apps/shared/avifjpeg.c`，见 A.6.6）。
+
+这个二选一正是问题的实质。但必须强调：**「ISO 21496-1 原文是否真的如此」我无法用原文确认**，故本段整体为【推断】，其可靠性完全依赖 Android 规范与实现侧的一致程度。
+
 ### B 节引用清单
 
 - [B-1] Android Developers, *Ultra HDR Image Format v1.1* — https://developer.android.com/media/platform/hdr-image-format （Encode / Gain map generation、Gain map container、Decode、Display、ISO 21496-1 Compatibility、Change Log 各节；页脚 Last updated 2024-10-25）
@@ -620,6 +1167,8 @@ struct uhdr_gainmap_metadata_frac {
 - [B-6] FFmpeg 源码：`libavutil/gain_map.h`、`libavcodec/gain_map.h` — https://github.com/FFmpeg/FFmpeg/blob/master/libavutil/gain_map.h ；文档页 https://ffmpeg.org/doxygen/trunk/libavutil_2gain__map_8h.html
 - [B-7] Android Developers, `android.graphics.Gainmap` API reference — https://developer.android.com/reference/android/graphics/Gainmap
 - [B-8] 本仓库代码与产物：`src/i2a/convert.rs`、`scripts/linux-build-libuhdr.sh`、`testoutput/MVIMG_3853.jpg`（字节偏移 8808 / 3604202 处的 APP2 段，实测）
+- [B-9] ISO Online Browsing Platform 预览页 `https://www.iso.org/obp/ui/en/#iso:std:iso:ts:21496:-1:ed-1:v1:en` —— **本次抓取返回 HTTP 403，未能读到任何目录、范围条款或术语定义**（B.8.1 如实记录）
+- [B-10] darktable / ImageMagick / monogrid/gainmap-js 三个仓库的源码树与关键文件（B.8 与 A.6 的实现侧核对）— https://github.com/darktable-org/darktable ；https://github.com/ImageMagick/ImageMagick （`coders/uhdr.c`、`coders/heic.c`）；https://github.com/monogrid/gainmap-js （`src/decode/webgl/materials/GainMapDecoderMaterial.ts`、`src/decode/shared/extract.ts`）
 
 ---
 
@@ -844,3 +1393,9 @@ README 列出 5 种编码场景（API-0 … API-4），其中 **API-4 = “SDR c
 4. **ISO 21496-1 正文的逐字条款**：标准付费（[B-2]），本文件的 ISO 侧描述来自 Adobe 规范（C 节）、Android 文档（B.1–B.4）与 FFmpeg/libultrahdr 源码（B.4.3、B.7），三者一致但都不等同于标准原文。
 5. **libultrahdr 为何在本仓库使用的 API-4 路径下不写 hdrgm XMP**：仅记录了实测现象与代码路径存在（B.6），未做因果核实。
 6. **ImageMagick Ultra HDR 支持的引入版本**：只有打包侧与 CVE 描述等二手信息。
+7. **Apple 的 gain map 编码器实际用的是哪个传输函数**（Rec.709 / sRGB / 其他）：Apple 文档只写「建议开发者怎么做」（A.2），Apple 专利 US 2024/0153053 A1 全文未规定 gain map 像素的传递函数（A.7.1），WWDC24 session 10177 只讲 API 用法（A.5.3）。**没有任何一手来源描述 Apple 编码器（命题 (b)）的实际做法**，详见 A.8。
+8. **`CGImageSourceCopyAuxiliaryDataInfoAtIndex` / CoreImage `.auxiliaryHDRGainMap` 返回的像素是否已被线性化**：Apple 文档未说明（A.5.4）；唯一旁证是第三方博客称 CoreImage 提取结果与 pillow-heif 原始字节「完全一致」（A.7.5），属【二手】，需逐字节实测复核。
+9. **CoreImage 的最终 HDR 渲染除 gain map 数学外还叠加了什么处理**：第三方实测报告其输出「显著超过 headroom」，且用 CoreImage 取数再手动转换仍有无法解释的偏差（A.7.2）。原因未知，直接影响「以 CoreImage 为参照」这条路线的可信度。
+10. **ISO 21496-1 原文是否规定 gain map 像素的传递函数**：ISO OBP 预览页返回 HTTP 403（[B-9]），标准正文付费（[B-2]），**原文未获取**。B.8 的结论来自 Android 规范与实现侧的一致旁证，属【推断】，不等同于标准原文。
+11. **`x^1.961` 与 Apple gain map 的关系**：经核实两者无关——`1.961` 属 Core Video 色彩配置与 macOS 显示链路的近似（[A-24]），不是 gain map 编码函数。记录于此以免后续被误引。
+12. **是否存在未公开的「Rec.709 vs sRGB」受控实测**：本次检索未找到（A.7.1 列出检索位置）。若将来出现，应优先采信。
