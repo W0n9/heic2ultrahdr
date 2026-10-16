@@ -56,7 +56,7 @@ fn heic_with_paired_mov_discovers_one_task() {
     assert_eq!(d.photos.len(), 1);
     let p = &d.photos[0];
     assert_same_file(&p.image, &heic);
-    assert_eq!(p.video.as_deref(), Some(mov.as_path()));
+    assert_same_file(p.video.as_deref().expect("video should be paired"), &mov);
     assert_eq!(p.output, f.root().join("IMG_0001.jpg"));
 }
 
