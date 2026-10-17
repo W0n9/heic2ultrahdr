@@ -4,7 +4,7 @@
 
 **Converting Apple HEIC photographs into UltraHDR JPEG motion photos.**
 
-**Author:** W0n9 · **Version:** 0.1.0 · [中文文档](README.zh-CN.md)
+**Author:** W0n9 · **Version:** 0.1.1 · [中文文档](README.zh-CN.md)
 
 ---
 

@@ -4,7 +4,7 @@
 
 **把 Apple HEIC 照片转换为 UltraHDR JPEG 动态照片。**
 
-**作者：** W0n9 · **版本：** 0.1.0 · [English](README.md)
+**作者：** W0n9 · **版本：** 0.1.1 · [English](README.md)
 
 ---
 
