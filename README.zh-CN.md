@@ -208,15 +208,19 @@ flowchart LR
 
 ### 3.3 动态照片封装
 
-对于实况照片，配对的视频被追加到 JPEG 末尾，并以 Android 相册应用所能理解的 GCamera XMP 约定加以描述：
+对于实况照片，配对的视频被追加到 JPEG 末尾，并以现行 Motion Photo 1.0 规范的 GCamera XMP 元数据加以描述：
 
-- `GCamera:MicroVideo = 1` 与 `MicroVideoVersion = 1` 把文件标记为动态照片；
-- `GCamera:MicroVideoOffset` 记录追加的字节数，播放器因此从 `文件大小 - MicroVideoOffset` 处开始读取视频；
-- `GCamera:MicroVideoPresentationTimestampUs = 1500000` 把静态画面定位在视频的第 1.5 秒，与 Apple 为实况照片选取关键帧的位置一致。
+- `GCamera:MotionPhoto = 1` 与 `MotionPhotoVersion = 1` 把文件标记为动态照片；
+- `GCamera:MotionPhotoPresentationTimestampUs = 1500000` 把静态画面定位在视频的第 1.5 秒，与 Apple 为实况照片选取关键帧的位置一致；
+- `Container:Directory` 目录声明文件组成——第一项声明主图（`image/jpeg` / `Primary`），第二项声明视频（`video/mp4` / `MotionPhoto`），以 `Item:Length` 记录视频字节数、`Item:Padding = 0`。规范读取方据此从文件末尾定位视频；微信等按规范实现的应用只认这套约定。
 
-追加之前会检查视频的音轨。Apple 用 `pcm_s16le` 编码实况照片音频，Android 播放器普遍不支持；这类音轨会被转码为 128 kbit/s 的 AAC。已带 AAC 或 AC-3 音频的视频原样追加，无音轨的视频亦原样追加。
+旧版 `MicroVideo` 约定已从规范删除并要求读取方忽略，本工具不写；只认 MicroVideo 的旧版相册属刻意放弃（现行小米相册的编辑产物即规范形态，微信实测发送正常）。
 
-输出的全部元数据 —— 从源图拷贝的 tag 加上 GCamera 字段 —— 在**单次** exiftool 调用中写完。早先的设计分两趟写入，每一趟都让 exiftool 把整个输出文件重写一遍；合并之后，每张照片省下一到两次完整重写。
+这套 XMP 不经过 exiftool —— exiftool 对 MotionPhoto 与 Container 标签只读不写；XMP 包由实现直接生成，对 JPEG 做 APP1 段级写入（见 `src/i2a/xmp.rs`）。
+
+追加之前，视频统一经 libavformat 重封装为 moov 前置（faststart）、brand 为 mp42 的 MP4：原样追加的 QuickTime MOV（`ftyp qt  `、moov 后置）会让微信判为「无法预览此实况照片」而降级为静态图片。重封装还顺带丢掉 MOV 里的元数据轨。音频方面，Apple 用 `pcm_s16le` 编码实况照片音频，Android 播放器普遍不支持，转码为 128 kbit/s 的 AAC；已带 AAC 或 AC-3 音频、或没有音轨的视频则流拷贝，不碰编码参数。
+
+输出的其余元数据 —— 从源图拷贝的 tag 加上小米私有的 `Exif 0x8897` 动态照片标记 —— 在**单次** exiftool 调用中写完。早先的设计分两趟写入，每一趟都让 exiftool 把整个输出文件重写一遍；合并之后，每张照片省下一到两次完整重写。
 
 ---
 

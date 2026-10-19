@@ -290,24 +290,41 @@ Display P3. These are properties of Apple's encoder, not restrictions invented h
 
 ### 3.3 Motion photo packaging
 
-For a Live Photo, the paired video is appended to the JPEG and described with the
-GCamera XMP convention that Android gallery applications understand:
+For a Live Photo, the paired video is appended to the JPEG and described with GCamera
+XMP metadata following the current Motion Photo 1.0 specification:
 
-- `GCamera:MicroVideo = 1` and `MicroVideoVersion = 1` mark the file as a motion photo;
-- `GCamera:MicroVideoOffset` records the number of bytes appended, so a player reads the
-  video from `file_size - MicroVideoOffset`;
-- `GCamera:MicroVideoPresentationTimestampUs = 1500000` places the still 1.5 s into the
-  video, matching where Apple selects the key frame of a Live Photo.
+- `GCamera:MotionPhoto = 1` and `MotionPhotoVersion = 1` mark the file as a motion
+  photo;
+- `GCamera:MotionPhotoPresentationTimestampUs = 1500000` places the still 1.5 s into
+  the video, matching where Apple selects the key frame of a Live Photo;
+- a `Container:Directory` declares the file's composition — the first item is the
+  primary image (`image/jpeg` / `Primary`), the second the video (`video/mp4` /
+  `MotionPhoto`) with `Item:Length` recording its byte count and `Item:Padding = 0`.
+  Spec-compliant readers locate the video at the end of the file from this directory;
+  applications implementing the spec, WeChat among them, recognise only this form.
 
-Before appending, the video's audio track is inspected. Apple encodes Live Photo audio
-as `pcm_s16le`, which Android players do not widely support; such tracks are transcoded
-to AAC at 128 kbit/s. Videos already carrying AAC or AC-3 audio are appended unchanged,
-and videos with no audio track are appended as-is.
+The legacy MicroVideo convention has been removed from the spec, which requires
+readers to ignore it, and is not written here; gallery builds old enough to know only
+MicroVideo are deliberately out of scope (current Xiaomi Gallery output already uses
+the spec form, and WeChat accepts these files in practice).
 
-All metadata for the output — tags copied from the source image plus the GCamera fields
-— is written in a **single** exiftool invocation. An earlier design wrote it in two
-passes, each of which made exiftool rewrite the entire output file; collapsing them
-removed one to two full rewrites per photograph.
+This XMP does not go through exiftool — exiftool reads but cannot write the
+MotionPhoto and Container tags; the packet is generated directly and written as an
+APP1 segment of the JPEG (see `src/i2a/xmp.rs`).
+
+Before appending, every video is remuxed through libavformat into a faststart
+(moov-first) MP4 branded mp42: an Apple QuickTime MOV appended as-is (`ftyp qt  `,
+moov at the end) makes WeChat report the live photo as unpreviewable and fall back to
+a static image. Remuxing also drops the MOV's metadata tracks. For audio, Apple
+encodes Live Photo audio as `pcm_s16le`, which Android players do not widely support,
+so such tracks are transcoded to AAC at 128 kbit/s; videos already carrying AAC or
+AC-3 audio, or no audio at all, are stream-copied untouched.
+
+The remaining output metadata — tags copied from the source image plus Xiaomi's
+private `Exif 0x8897` motion-photo marker — is written in a **single** exiftool
+invocation. An earlier design wrote it in two passes, each of which made exiftool
+rewrite the entire output file; collapsing them removed one to two full rewrites per
+photograph.
 
 ---
 

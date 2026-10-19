@@ -82,14 +82,18 @@ impl ConvertRequest {
     }
 
     pub(crate) fn output_is_motion_photo(&self) -> Result<bool> {
-        let micro_video = self.exif_tool().get_value(&self.output_path, "XMP-GCamera:MicroVideo")?;
-        Ok(micro_video.is_some())
+        let bytes = std::fs::read(&self.output_path).context("read output failed")?;
+        Ok(super::xmp::is_motion_photo(&bytes))
     }
 
-    /// 一次性写完输出文件的全部元数据：从源图拷贝所需 tag + 动态照片的 XMP 标签。
+    /// 一次性写完输出文件的全部元数据：从源图拷贝所需 tag + 动态照片标记。
     /// `video_size` 是实际追加到输出末尾的视频字节数（静态照片传 None）。
     /// 原实现拆成 copy_meta + update_motion_photo_exif 两次调用，每次都让 exiftool
     /// 用 -overwrite_original 整个重写文件，等于把输出白白多写 1~2 遍。
+    ///
+    /// 动态照片的 GCamera XMP（Motion Photo 1.0：MotionPhoto 标记 +
+    /// Container:Directory）不经过 exiftool：12.76 对这些标签只读不写。
+    /// exiftool 只负责拷贝源图元数据与写小米私有标记，XMP 段随后由 xmp 模块整体替换。
     pub(crate) fn write_output_metadata(&self, src_image: &Path, video_size: Option<u64>) -> anyhow::Result<()> {
         // release exiftool.config
         use std::io::Write;
@@ -103,14 +107,8 @@ impl ConvertRequest {
             .arg("-TagsFromFile")
             .arg(src_image.as_os_str())
             .arg("-Orientation="); // 清掉来自 HEIC 的方向 tag，方向已体现在像素数据里
-        if let Some(video_size) = video_size {
-            cmd.args([
-                "-XMP-GCamera:MicroVideo=1",
-                "-XMP-GCamera:MicroVideoVersion=1",
-                "-XMP-GCamera:MicroVideoPresentationTimestampUs=1500000",
-            ])
-            .arg(format!("-XMP-GCamera:MicroVideoOffset={video_size}"))
-            .arg("-XiaomiTag=1");
+        if video_size.is_some() {
+            cmd.arg("-XiaomiTag=1");
         }
         cmd.arg("-overwrite_original")
             .arg("-m") // ignore minor error, as per https://exiftool.org/forum/index.php?topic=7341.0
@@ -122,25 +120,10 @@ impl ConvertRequest {
             bail!("Run exiftool failed when writing exif tags: {}", stderr);
         }
 
-        /* 小米的 tag 写不进去，放弃 exiv2 库
-        let metadata =
-            rexiv2::Metadata::new_from_path(&self.output_path).context("rexiv2 open failed")?;
-        // set namespace
-        rexiv2::register_xmp_namespace("http://ns.google.com/photos/1.0/camera/", "GCamera").ok();
-        metadata
-            .set_tag_numeric("Xmp.GCamera.MicroVideo", 1)
-            .context("set Xmp.GCamera.MicroVideo failed")?;
-        metadata.set_tag_numeric("Xmp.GCamera.MicroVideoVersion", 1)?;
-        let offset = self.video_path.metadata()?.len();
-        metadata.set_tag_numeric("Xmp.GCamera.MicroVideoOffset", offset as i32)?;
-        // # in Apple Live Photos, the chosen photo is 1.5s after the start of the video, so 1500000 microseconds
-        metadata.set_tag_numeric("Xmp.GCamera.MicroVideoPresentationTimestampUs", 1500000)?;
-        // Xiaomi magic tag，这个 exiv2 写不进去
-        metadata.set_tag_numeric("Exif.Photo.0x8897", 0x1)?;
-        metadata
-            .save_to_file(&self.output_path)
-            .context("rexiv2 save failed")?;
-        */
+        if let Some(video_size) = video_size {
+            // 在 exiftool 重写之后做段级写入，XMP 包才不会被改写
+            super::xmp::write_motion_photo_xmp(&self.output_path, video_size)?;
+        }
 
         Ok(())
     }

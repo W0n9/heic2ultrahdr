@@ -24,7 +24,7 @@
 
 ## 动态照片 (motion photo)
 
-Android (GCamera XMP) 语义：JPEG 数据末尾追加视频字节，`MicroVideoOffset` 记录追加的实际字节数。对应 Apple 的 Live Photo 源（HEIC + MOV）。
+Android (GCamera XMP) 语义：JPEG 数据末尾追加视频字节，按现行 Motion Photo 1.0 规范写 `MotionPhoto` 标记 + `Container:Directory`（`Item:Length` = 视频字节数，读取方据此从文件末尾定位视频）；旧版 `MicroVideo*` 已被规范废弃，不写。视频统一重封装为 faststart mp42。对应 Apple 的 Live Photo 源（HEIC + MOV）。
 
 ## Apple HDR gainmap
 

@@ -2,10 +2,82 @@ use anyhow::{Context, Result};
 use rsmpeg::{
     avcodec::AVCodecContext,
     avformat::{AVFormatContextInput, AVFormatContextOutput},
-    avutil::AVAudioFifo,
+    avutil::{AVAudioFifo, AVDictionary},
     swresample::SwrContext,
 };
 use std::{ffi::CString, path::Path};
+
+/// 内嵌动态照片视频的 MP4 封装选项：moov 前置（faststart）便于读取方快速解析，
+/// brand 取 mp42 对齐 Android 原生动态照片的产物形态。
+fn mp4_muxer_options() -> AVDictionary {
+    AVDictionary::new(c"movflags", c"faststart", 0).set(c"brand", c"mp42", 0)
+}
+
+fn open_input(path: &Path) -> Result<AVFormatContextInput> {
+    let input = CString::new(path.to_str().context("input path to_str failed")?)?;
+    let mut input_options = None;
+    let format_context = rsmpeg::avformat::AVFormatContextInput::open(&input, None, &mut input_options)?;
+    Ok(format_context)
+}
+
+fn create_output(path: &Path) -> Result<AVFormatContextOutput> {
+    let output = CString::new(path.to_str().context("output path to_str failed")?)?;
+    let format_context = rsmpeg::avformat::AVFormatContextOutput::create(&output, None)?;
+    Ok(format_context)
+}
+
+/// 无损重封装：流拷贝为 faststart MP4，不解码。
+///
+/// 用于音频本就兼容（AAC/AC-3）或没有音轨的动态照片视频。原样追加 Apple MOV
+/// 会把 `ftyp qt  ` 且 moov 后置的 QuickTime 容器带给读取方，微信会判为无法预览；
+/// 重封装还顺带丢掉 MOV 里的元数据轨（mebx 等 data 流）。
+pub struct RemuxRequest<'a> {
+    pub input: &'a Path,
+    pub output: &'a Path,
+}
+
+impl RemuxRequest<'_> {
+    pub fn execute(&self) -> Result<()> {
+        VideoAudioEncodeRequest::mute_ffmpeg_log();
+        let mut i_fmt_ctx = open_input(self.input)?;
+        let mut o_fmt_ctx = create_output(self.output)?;
+
+        // 选定要拷贝的流：最佳视频流（必须有）+ 最佳音频流（可选）
+        let (video_in_idx, _) = i_fmt_ctx
+            .find_best_stream(rsmpeg::ffi::AVMEDIA_TYPE_VIDEO)
+            .context("find video stream failed")?
+            .context("no video stream in live photo video")?;
+        let mut selected = vec![video_in_idx];
+        if let Some((audio_in_idx, _)) = i_fmt_ctx
+            .find_best_stream(rsmpeg::ffi::AVMEDIA_TYPE_AUDIO)
+            .context("find audio stream failed")?
+        {
+            selected.push(audio_in_idx);
+        }
+
+        let mut mapping: Vec<(usize, usize)> = Vec::with_capacity(selected.len());
+        for &in_idx in &selected {
+            let mut o_stream = o_fmt_ctx.new_stream();
+            o_stream.codecpar_mut().copy(&i_fmt_ctx.streams()[in_idx].codecpar());
+            mapping.push((in_idx, o_stream.index as usize));
+        }
+
+        let mut options = Some(mp4_muxer_options());
+        o_fmt_ctx.write_header(&mut options).context("output context write header failed")?;
+
+        while let Some(mut packet) = i_fmt_ctx.read_packet().context("read packet failed")? {
+            let Some(&(in_idx, out_idx)) = mapping.iter().find(|&&(in_idx, _)| in_idx == packet.stream_index as usize) else {
+                continue;
+            };
+            packet.rescale_ts(i_fmt_ctx.streams()[in_idx].time_base, o_fmt_ctx.streams()[out_idx].time_base);
+            packet.set_stream_index(out_idx as i32);
+            o_fmt_ctx.write_frame(&mut packet).context("o_fmt_ctx write frame failed")?;
+        }
+
+        o_fmt_ctx.write_trailer().context("write trailer failed")?;
+        Ok(())
+    }
+}
 
 pub struct VideoAudioEncodeRequest<'a> {
     pub input: &'a Path,
@@ -21,10 +93,10 @@ impl VideoAudioEncodeRequest<'_> {
 
     pub fn execute(&self) -> Result<()> {
         // 1.a open input
-        let mut i_fmt_ctx = self.input_format_context().context("create input format context failed")?;
+        let mut i_fmt_ctx = open_input(self.input).context("create input format context failed")?;
 
         // 1.b open output
-        let mut o_fmt_ctx = self.output_format_context().context("create output format context failed")?;
+        let mut o_fmt_ctx = create_output(self.output).context("create output format context failed")?;
 
         // 2.a configurations: video
         let (input_video_idx, output_video_idx) =
@@ -42,7 +114,7 @@ impl VideoAudioEncodeRequest<'_> {
         );
 
         // 3. open and write header
-        let mut output_options = None;
+        let mut output_options = Some(mp4_muxer_options());
         o_fmt_ctx
             .write_header(&mut output_options)
             .context("output context write header failed")?;
@@ -128,21 +200,6 @@ impl VideoAudioEncodeRequest<'_> {
         o_fmt_ctx.write_trailer().context("write trailer failed")?;
 
         Ok(())
-    }
-
-    fn input_format_context(&self) -> Result<AVFormatContextInput> {
-        let input = self.input.to_str().context("input path to_str failed")?;
-        let input = CString::new(input)?;
-        let mut input_options = None;
-        let format_context = rsmpeg::avformat::AVFormatContextInput::open(&input, None, &mut input_options)?;
-        Ok(format_context)
-    }
-
-    fn output_format_context(&self) -> Result<AVFormatContextOutput> {
-        let output = self.output.to_str().context("output path to_str failed")?;
-        let output = CString::new(output)?;
-        let format_context = rsmpeg::avformat::AVFormatContextOutput::create(&output, None)?;
-        Ok(format_context)
     }
 
     fn get_video_stream_index(i_fmt_ctx: &AVFormatContextInput, o_fmt_ctx: &mut AVFormatContextOutput) -> Result<(usize, usize)> {
